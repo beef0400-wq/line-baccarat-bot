@@ -62,23 +62,24 @@ def callback():
         return "OK", 200
 
     for event in data.get("events", []):
-    if event.get("type") != "message":
-        continue
+        if event.get("type") != "message":
+            continue
 
-    message = event.get("message", {})
-    if message.get("type") != "text":
-        continue
+        message = event.get("message", {})
+        if message.get("type") != "text":
+            continue
 
-    text = message.get("text", "").strip()
-    reply_token = event.get("replyToken")
+        text = message.get("text", "").strip()
+        reply_token = event.get("replyToken")
 
-    if not reply_token:
-        continue
+        if not reply_token:
+            continue
 
-    if "莊" in text:
-        reply_message(reply_token, "收到莊")
-    elif "閒" in text:
-        reply_message(reply_token, "收到閒")
-    else:
-        reply_message(reply_token, f"你剛剛說：{text}")
+        if "莊" in text:
+            reply_message(reply_token, "收到莊")
+        elif "閒" in text:
+            reply_message(reply_token, "收到閒")
+        else:
+            reply_message(reply_token, f"你剛剛說：{text}")
+
     return "OK", 200
