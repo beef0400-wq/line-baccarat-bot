@@ -12,26 +12,29 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
 
-def reply_message(reply_token, text):
+def reply_message(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
     payload = {
         "replyToken": reply_token,
         "messages": [
-            {"type": "text", "text": text}
-        ]
+            {
+                "type": "text",
+                "text": text,
+            }
+        ],
     }
     requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
 
 
-def verify_signature(body, signature):
+def verify_signature(body: bytes, signature: str) -> bool:
     digest = hmac.new(
         LINE_CHANNEL_SECRET.encode("utf-8"),
         body,
-        hashlib.sha256
+        hashlib.sha256,
     ).digest()
     expected_signature = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(expected_signature, signature)
