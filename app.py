@@ -61,7 +61,7 @@ def callback():
     except Exception:
         return "OK", 200
 
-        for event in data.get("events", []):
+    for event in data.get("events", []):
         if event.get("type") != "message":
             continue
 
