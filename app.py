@@ -61,7 +61,7 @@ def callback():
     except Exception:
         return "OK", 200
 
-    for event in data.get("events", []):
+        for event in data.get("events", []):
         if event.get("type") != "message":
             continue
 
@@ -75,9 +75,9 @@ def callback():
         if not reply_token:
             continue
 
-        if text == "莊":
+        if "莊" in text:
             reply_message(reply_token, "收到莊")
-        elif text == "閒":
+        elif "閒" in text:
             reply_message(reply_token, "收到閒")
         else:
             reply_message(reply_token, "請輸入：莊 或 閒")
