@@ -20,7 +20,8 @@ ADMIN_USER_IDS = set(
 
 TZ_TW = timezone(timedelta(hours=8))
 TIMEOUT_MINUTES = 20
-MAX_ROAD = 20
+MAX_ROAD = 100
+MIN_IMPORT_HANDS = 15
 
 
 # =========================
@@ -31,41 +32,49 @@ def get_conn():
 
 
 def init_db():
-    sql = """
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        line_user_id TEXT UNIQUE NOT NULL,
-        game_account TEXT UNIQUE,
-        vip_expire_at TIMESTAMP NULL,
-        trial_end_at TIMESTAMP NULL,
-        current_road JSONB NOT NULL DEFAULT '[]'::jsonb,
-        pending_flow TEXT NULL,
-        last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_users_game_account ON users(game_account);
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            line_user_id TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS game_account TEXT UNIQUE;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_expire_at TIMESTAMP NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_end_at TIMESTAMP NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_road JSONB NOT NULL DEFAULT '[]'::jsonb;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_flow TEXT NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS analysis_active BOOLEAN NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS imported_ready BOOLEAN NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;",
+        "CREATE INDEX IF NOT EXISTS idx_users_game_account ON users(game_account);",
+        """
+        CREATE TABLE IF NOT EXISTS analysis_logs (
+            id SERIAL PRIMARY KEY,
+            line_user_id TEXT NOT NULL,
+            road_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
+            banker_pct INTEGER NOT NULL,
+            player_pct INTEGER NOT NULL,
+            pattern TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            actual_next_result TEXT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_analysis_logs_user ON analysis_logs(line_user_id);",
+    ]
 
-    CREATE TABLE IF NOT EXISTS analysis_logs (
-        id SERIAL PRIMARY KEY,
-        line_user_id TEXT NOT NULL,
-        road_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
-        banker_pct INTEGER NOT NULL,
-        player_pct INTEGER NOT NULL,
-        pattern TEXT NOT NULL,
-        risk TEXT NOT NULL,
-        actual_next_result TEXT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql)
+            for stmt in statements:
+                cur.execute(stmt)
         conn.commit()
 
 
 # =========================
-# Common helpers
+# Helpers
 # =========================
 def now_tw():
     return datetime.now(TZ_TW).replace(tzinfo=None)
@@ -104,24 +113,27 @@ def make_quick_reply(labels_and_texts):
     return items
 
 
-def base_quick_reply(is_admin=False):
-    items = [
-        ("莊", "莊"),
-        ("閒", "閒"),
-        ("和", "和"),
-        ("分析", "分析"),
-        ("牌路", "牌路"),
-        ("重設", "重設"),
-    ]
-    if is_admin:
+def base_quick_reply(is_admin=False, analysis_active=False):
+    if analysis_active:
         items = [
             ("莊", "莊"),
             ("閒", "閒"),
             ("和", "和"),
             ("分析", "分析"),
             ("牌路", "牌路"),
-            ("/待開通", "/待開通"),
+            ("結束分析", "結束分析"),
         ]
+    else:
+        items = [
+            ("開始", "開始"),
+            ("匯入牌路", "匯入牌路"),
+            ("開始分析", "開始分析"),
+            ("牌路", "牌路"),
+            ("分析", "分析"),
+            ("綁定帳號", "綁定帳號"),
+        ]
+    if is_admin:
+        items[-1] = ("/待開通", "/待開通")
     return make_quick_reply(items)
 
 
@@ -154,7 +166,7 @@ def push_message(user_id: str, text: str):
 
 
 # =========================
-# User helpers
+# User / state
 # =========================
 def get_user(line_user_id: str):
     with get_conn() as conn:
@@ -174,6 +186,8 @@ def ensure_user(line_user_id: str):
                         """
                         UPDATE users
                         SET current_road = '[]'::jsonb,
+                            analysis_active = FALSE,
+                            imported_ready = FALSE,
                             updated_at = %s
                         WHERE line_user_id = %s
                         RETURNING *
@@ -189,15 +203,16 @@ def ensure_user(line_user_id: str):
             cur.execute(
                 """
                 INSERT INTO users (
-                    line_user_id, trial_end_at, current_road,
-                    last_active_at, created_at, updated_at
+                    line_user_id, trial_end_at, current_road, pending_flow,
+                    analysis_active, imported_ready, last_active_at, created_at, updated_at
                 )
-                VALUES (%s, %s, '[]'::jsonb, %s, %s, %s)
+                VALUES (%s, %s, '[]'::jsonb, NULL, FALSE, FALSE, %s, %s, %s)
                 RETURNING *
                 """,
                 (
                     line_user_id,
                     now_tw() + timedelta(hours=3),
+                    now_tw(),
                     now_tw(),
                     now_tw(),
                     now_tw(),
@@ -208,19 +223,56 @@ def ensure_user(line_user_id: str):
         return user
 
 
-def touch_user(line_user_id: str):
+def update_user_fields(line_user_id: str, **fields):
+    if not fields:
+        return get_user(line_user_id)
+
+    allowed = {
+        "game_account",
+        "vip_expire_at",
+        "trial_end_at",
+        "current_road",
+        "pending_flow",
+        "analysis_active",
+        "imported_ready",
+        "last_active_at",
+        "updated_at",
+    }
+
+    set_parts = []
+    values = []
+
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        if key == "current_road":
+            set_parts.append(f"{key} = %s::jsonb")
+            values.append(json.dumps(value, ensure_ascii=False))
+        else:
+            set_parts.append(f"{key} = %s")
+            values.append(value)
+
+    set_parts.append("updated_at = %s")
+    values.append(now_tw())
+    values.append(line_user_id)
+
+    sql = f"""
+    UPDATE users
+    SET {", ".join(set_parts)}
+    WHERE line_user_id = %s
+    RETURNING *
+    """
+
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET last_active_at = %s,
-                    updated_at = %s
-                WHERE line_user_id = %s
-                """,
-                (now_tw(), now_tw(), line_user_id),
-            )
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, tuple(values))
+            row = cur.fetchone()
         conn.commit()
+        return row
+
+
+def touch_user(line_user_id: str):
+    return update_user_fields(line_user_id, last_active_at=now_tw())
 
 
 def is_vip(user) -> bool:
@@ -237,36 +289,12 @@ def minutes_left(dt):
     return max(int((dt - now_tw()).total_seconds() // 60), 0)
 
 
-def set_pending_flow(line_user_id: str, flow):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET pending_flow = %s,
-                    updated_at = %s
-                WHERE line_user_id = %s
-                """,
-                (flow, now_tw(), line_user_id),
-            )
-        conn.commit()
-
-
+# =========================
+# Admin / binding
+# =========================
 def set_game_account(line_user_id: str, game_account: str) -> bool:
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE users
-                    SET game_account = %s,
-                        pending_flow = NULL,
-                        updated_at = %s
-                    WHERE line_user_id = %s
-                    """,
-                    (game_account, now_tw(), line_user_id),
-                )
-            conn.commit()
+        update_user_fields(line_user_id, game_account=game_account, pending_flow=None)
         return True
     except psycopg2.Error:
         return False
@@ -290,20 +318,16 @@ def grant_vip_by_game_account(game_account: str, days: int):
     else:
         new_expire = now_tw() + timedelta(days=days)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET vip_expire_at = %s,
-                    updated_at = %s
-                WHERE game_account = %s
-                """,
-                (new_expire, now_tw(), game_account),
-            )
-        conn.commit()
-
+    update_user_fields(user["line_user_id"], vip_expire_at=new_expire)
     return get_user_by_game_account(game_account), None
+
+
+def revoke_vip_by_game_account(game_account: str):
+    user = get_user_by_game_account(game_account)
+    if not user:
+        return False
+    update_user_fields(user["line_user_id"], vip_expire_at=None)
+    return True
 
 
 def list_pending_accounts():
@@ -322,35 +346,30 @@ def list_pending_accounts():
             return cur.fetchall()
 
 
-def revoke_vip_by_game_account(game_account: str):
-    user = get_user_by_game_account(game_account)
-    if not user:
-        return False
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET vip_expire_at = NULL,
-                    updated_at = %s
-                WHERE game_account = %s
-                """,
-                (now_tw(), game_account),
-            )
-        conn.commit()
-    return True
-
-
 # =========================
-# Road / Pattern / Analysis
+# Road helpers
 # =========================
 def road_text(road, limit=None):
     data = road[-limit:] if limit else road
-    return " ".join(data) if data else "尚無資料"
+    return "".join(data) if data else "尚無資料"
 
 
 def filter_main_road(road):
     return [x for x in road if x in ["莊", "閒"]]
+
+
+def normalize_input_road(raw: str):
+    raw = raw.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    tokens = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch in ["莊", "閒", "和"]:
+            tokens.append(ch)
+            i += 1
+        else:
+            return None
+    return tokens
 
 
 def count_tail_same(seq):
@@ -395,7 +414,7 @@ def classify_pattern(seq):
     if len(seq) < 2:
         return "資料不足", "高"
 
-    tail_count, _tail_side = count_tail_same(seq)
+    tail_count, _ = count_tail_same(seq)
     if tail_count >= 5:
         return "長連續型", "中低"
 
@@ -498,7 +517,7 @@ def probability_card(road):
 
 
 # =========================
-# Analysis logs / backtest
+# Backtest logs
 # =========================
 def create_analysis_log(line_user_id: str, road):
     data = pattern_percentages(road)
@@ -541,7 +560,6 @@ def backfill_previous_actual(line_user_id: str, actual_result: str):
                 (line_user_id,),
             )
             row = cur.fetchone()
-
             if row:
                 cur.execute(
                     """
@@ -586,7 +604,7 @@ def hit_rate_summary(line_user_id: str):
 
 
 # =========================
-# Status / road ops
+# Status / menus
 # =========================
 def get_status_text(user):
     if is_vip(user):
@@ -614,55 +632,18 @@ def get_status_text(user):
     )
 
 
-def add_result(line_user_id: str, result: str):
-    user = ensure_user(line_user_id)
-    road = user["current_road"] or []
-    road.append(result)
-    road = road[-MAX_ROAD:]
-
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET current_road = %s::jsonb,
-                    last_active_at = %s,
-                    updated_at = %s
-                WHERE line_user_id = %s
-                RETURNING *
-                """,
-                (json.dumps(road, ensure_ascii=False), now_tw(), now_tw(), line_user_id),
-            )
-            row = cur.fetchone()
-        conn.commit()
-        return row
-
-
-def clear_road(line_user_id: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE users
-                SET current_road = '[]'::jsonb,
-                    updated_at = %s
-                WHERE line_user_id = %s
-                """,
-                (now_tw(), line_user_id),
-            )
-        conn.commit()
-
-
 def menu_text(user):
     tag = "VIP會員" if is_vip(user) else ("免費試用中" if in_trial(user) else "免費版")
     return (
         f"歡迎使用百家即時分析助手（{tag}）\n\n"
-        "可直接輸入：\n"
-        "莊 / 閒 / 和\n\n"
+        "可用流程：\n"
+        "1. 匯入牌路\n"
+        "2. 開始分析\n"
+        "3. 分析中逐口按 莊 / 閒 / 和\n"
+        "4. 結束分析\n\n"
         "常用功能：\n"
         "牌路\n"
         "分析\n"
-        "重設\n"
         "綁定帳號\n"
         "查詢資格"
     )
@@ -706,7 +687,7 @@ def callback():
                 reply_message(
                     reply_token,
                     menu_text(user),
-                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
                 )
             continue
 
@@ -727,43 +708,41 @@ def callback():
         touch_user(user_id)
         user = get_user(user_id)
 
-        # =========================
-        # Admin commands
-        # =========================
+        # 管理員指令
         if user_id in ADMIN_USER_IDS and text == "/待開通":
             pending = list_pending_accounts()
             if not pending:
-                reply_message(reply_token, "目前沒有待開通名單。", quick_items=base_quick_reply(True))
+                reply_message(reply_token, "目前沒有待開通名單。", quick_items=base_quick_reply(True, user["analysis_active"]))
             else:
                 rows = [f"{i}. {row['game_account']}" for i, row in enumerate(pending[:20], start=1)]
                 reply_message(
                     reply_token,
                     "待開通名單：\n" + "\n".join(rows),
-                    quick_items=base_quick_reply(True),
+                    quick_items=base_quick_reply(True, user["analysis_active"]),
                 )
             continue
 
         if user_id in ADMIN_USER_IDS and text.startswith("/vip "):
             parts = text.split()
             if len(parts) != 3:
-                reply_message(reply_token, "格式錯誤，請用：/vip 遊戲帳號 天數", quick_items=base_quick_reply(True))
+                reply_message(reply_token, "格式錯誤，請用：/vip 遊戲帳號 天數", quick_items=base_quick_reply(True, user["analysis_active"]))
                 continue
 
             game_account = parts[1]
             try:
                 days = int(parts[2])
             except ValueError:
-                reply_message(reply_token, "天數請輸入數字，例如：/vip ck76888 30", quick_items=base_quick_reply(True))
+                reply_message(reply_token, "天數請輸入數字，例如：/vip ck76888 30", quick_items=base_quick_reply(True, user["analysis_active"]))
                 continue
 
             updated_user, err = grant_vip_by_game_account(game_account, days)
             if err:
-                reply_message(reply_token, err, quick_items=base_quick_reply(True))
+                reply_message(reply_token, err, quick_items=base_quick_reply(True, user["analysis_active"]))
             else:
                 reply_message(
                     reply_token,
                     f"已開通VIP\n\n帳號：{game_account}\n天數：{days}天\n到期：{updated_user['vip_expire_at']}",
-                    quick_items=base_quick_reply(True),
+                    quick_items=base_quick_reply(True, user["analysis_active"]),
                 )
                 push_message(
                     updated_user["line_user_id"],
@@ -774,65 +753,59 @@ def callback():
         if user_id in ADMIN_USER_IDS and text.startswith("/unvip "):
             parts = text.split()
             if len(parts) != 2:
-                reply_message(reply_token, "格式錯誤，請用：/unvip 遊戲帳號", quick_items=base_quick_reply(True))
+                reply_message(reply_token, "格式錯誤，請用：/unvip 遊戲帳號", quick_items=base_quick_reply(True, user["analysis_active"]))
                 continue
 
             ok = revoke_vip_by_game_account(parts[1])
             reply_message(
                 reply_token,
                 f"已取消VIP：{parts[1]}" if ok else "找不到這個遊戲帳號。",
-                quick_items=base_quick_reply(True),
+                quick_items=base_quick_reply(True, user["analysis_active"]),
             )
             continue
 
-        # =========================
-        # Bind flow
-        # =========================
+        # 綁定流程
         if user.get("pending_flow") == "bind_game_account":
             ok = set_game_account(user_id, text)
             if ok:
                 reply_message(
                     reply_token,
                     f"已收到你的遊戲帳號：{text}\n\n請等待管理員確認開通VIP。",
-                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
                 )
             else:
                 reply_message(
                     reply_token,
                     "這個遊戲帳號可能已被綁定，請換一個或聯絡管理員。",
-                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
                 )
             continue
 
-        # =========================
-        # Trial / VIP lock
-        # =========================
+        # 試用 / VIP 鎖定
         if not is_vip(user) and not in_trial(user):
-            if text in ["分析", "牌路", "莊", "閒", "和"]:
+            if text in ["分析", "牌路", "匯入牌路", "開始分析", "莊", "閒", "和"]:
                 reply_message(
                     reply_token,
                     get_status_text(user),
-                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
                 )
                 continue
 
-        # =========================
-        # General commands
-        # =========================
+        # 一般功能
         if text == "開始":
             reply_message(
                 reply_token,
                 menu_text(user),
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
             )
             continue
 
         if text == "綁定帳號":
-            set_pending_flow(user_id, "bind_game_account")
+            update_user_fields(user_id, pending_flow="bind_game_account")
             reply_message(
                 reply_token,
                 "請輸入你的遊戲帳號\n例如：ck76888",
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
             )
             continue
 
@@ -840,14 +813,108 @@ def callback():
             reply_message(
                 reply_token,
                 get_status_text(user),
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
+            )
+            continue
+
+        if text == "匯入牌路":
+            update_user_fields(user_id, pending_flow="import_road")
+            reply_message(
+                reply_token,
+                "請一次輸入目前牌路\n格式例如：\n莊莊莊閒莊閒莊閒莊莊閒閒莊閒莊\n\n至少15把才可啟動分析",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
+            )
+            continue
+
+        if user.get("pending_flow") == "import_road":
+            parsed = normalize_input_road(text)
+            if not parsed:
+                reply_message(
+                    reply_token,
+                    "格式錯誤，請只輸入：莊 / 閒 / 和\n例如：莊莊莊閒莊閒",
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
+                )
+                continue
+
+            if len(parsed) < MIN_IMPORT_HANDS:
+                reply_message(
+                    reply_token,
+                    f"目前只有 {len(parsed)} 把，至少要 {MIN_IMPORT_HANDS} 把才能開始分析。",
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
+                )
+                continue
+
+            update_user_fields(
+                user_id,
+                current_road=parsed[-MAX_ROAD:],
+                pending_flow=None,
+                imported_ready=True,
+                analysis_active=False,
+            )
+            imported_user = get_user(user_id)
+            reply_message(
+                reply_token,
+                "牌路匯入完成\n\n"
+                f"目前牌路：\n{road_text(imported_user['current_road'])}\n\n"
+                "接下來請輸入：開始分析",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
+            )
+            continue
+
+        if text == "開始分析":
+            if not user["imported_ready"]:
+                reply_message(
+                    reply_token,
+                    f"請先匯入至少 {MIN_IMPORT_HANDS} 把牌路，再開始分析。",
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
+                )
+                continue
+
+            user = update_user_fields(user_id, analysis_active=True)
+            create_analysis_log(user_id, user["current_road"] or [])
+            card = probability_card(user["current_road"] or [])
+            if is_vip(user):
+                card += "\n\n" + hit_rate_summary(user_id)
+
+            reply_message(
+                reply_token,
+                "分析已啟動\n\n"
+                f"{card}\n\n"
+                "之後每開一口，直接按 莊 / 閒 / 和",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, True),
+            )
+            continue
+
+        if text == "結束分析":
+            user = update_user_fields(
+                user_id,
+                analysis_active=False,
+                imported_ready=False,
+                current_road=[],
+            )
+            reply_message(
+                reply_token,
+                "已結束本輪分析，牌路已清空。\n如要再次使用，請先重新匯入牌路。",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
             )
             continue
 
         if text in ["莊", "閒", "和"]:
+            if not user["analysis_active"]:
+                reply_message(
+                    reply_token,
+                    "請先完成：\n1. 匯入牌路\n2. 開始分析\n\n之後再逐口輸入 莊 / 閒 / 和",
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
+                )
+                continue
+
             backfill_previous_actual(user_id, text)
-            user = add_result(user_id, text)
+            road = user["current_road"] or []
+            road.append(text)
+            road = road[-MAX_ROAD:]
+            user = update_user_fields(user_id, current_road=road)
             create_analysis_log(user_id, user["current_road"] or [])
+
             card = probability_card(user["current_road"] or [])
             latest_user = get_user(user_id)
             if is_vip(latest_user):
@@ -856,7 +923,7 @@ def callback():
             reply_message(
                 reply_token,
                 f"已記錄：{text}\n\n{card}",
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, True),
             )
             continue
 
@@ -865,7 +932,7 @@ def callback():
             reply_message(
                 reply_token,
                 f"目前牌路：\n{road_text(user['current_road'] or [], limit)}",
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
             )
             continue
 
@@ -877,23 +944,28 @@ def callback():
             reply_message(
                 reply_token,
                 card,
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
             )
             continue
 
         if text == "重設":
-            clear_road(user_id)
+            user = update_user_fields(
+                user_id,
+                current_road=[],
+                imported_ready=False,
+                analysis_active=False,
+            )
             reply_message(
                 reply_token,
-                "已重設當前牌路。",
-                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                "已重設當前牌路與分析狀態。",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
             )
             continue
 
         reply_message(
             reply_token,
-            f"你剛剛說：{text}\n\n可用功能：開始 / 分析 / 牌路 / 綁定帳號 / 查詢資格 / 重設",
-            quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            f"你剛剛說：{text}\n\n可用功能：開始 / 匯入牌路 / 開始分析 / 牌路 / 分析 / 綁定帳號 / 查詢資格 / 結束分析",
+            quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
         )
 
     return "OK", 200
