@@ -14,13 +14,18 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-ADMIN_USER_IDS = set(x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip())
+ADMIN_USER_IDS = set(
+    x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
+)
 
 TZ_TW = timezone(timedelta(hours=8))
 TIMEOUT_MINUTES = 20
 MAX_ROAD = 20
 
 
+# =========================
+# DB
+# =========================
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
@@ -59,6 +64,9 @@ def init_db():
         conn.commit()
 
 
+# =========================
+# Common helpers
+# =========================
 def now_tw():
     return datetime.now(TZ_TW).replace(tzinfo=None)
 
@@ -106,7 +114,14 @@ def base_quick_reply(is_admin=False):
         ("重設", "重設"),
     ]
     if is_admin:
-        items = items[:5] + [("/待開通", "/待開通")]
+        items = [
+            ("莊", "莊"),
+            ("閒", "閒"),
+            ("和", "和"),
+            ("分析", "分析"),
+            ("牌路", "牌路"),
+            ("/待開通", "/待開通"),
+        ]
     return make_quick_reply(items)
 
 
@@ -114,6 +129,7 @@ def reply_message(reply_token: str, text: str, quick_items=None):
     msg = {"type": "text", "text": text}
     if quick_items:
         msg["quickReply"] = {"items": quick_items}
+
     payload = {"replyToken": reply_token, "messages": [msg]}
     r = requests.post(
         "https://api.line.me/v2/bot/message/reply",
@@ -137,6 +153,9 @@ def push_message(user_id: str, text: str):
     print("PUSH BODY:", r.text)
 
 
+# =========================
+# User helpers
+# =========================
 def get_user(line_user_id: str):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -218,7 +237,7 @@ def minutes_left(dt):
     return max(int((dt - now_tw()).total_seconds() // 60), 0)
 
 
-def set_pending_flow(line_user_id: str, flow: str | None):
+def set_pending_flow(line_user_id: str, flow):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -322,6 +341,9 @@ def revoke_vip_by_game_account(game_account: str):
     return True
 
 
+# =========================
+# Road / Pattern / Analysis
+# =========================
 def road_text(road, limit=None):
     data = road[-limit:] if limit else road
     return " ".join(data) if data else "尚無資料"
@@ -372,19 +394,24 @@ def alternation_count(seq):
 def classify_pattern(seq):
     if len(seq) < 2:
         return "資料不足", "高"
+
     tail_count, _tail_side = count_tail_same(seq)
     if tail_count >= 5:
         return "長連續型", "中低"
+
     segs = segment_lengths(seq)
     if len(segs) >= 4:
         tail = segs[-4:]
         if all(c == 2 for _, c in tail[:-1]) and tail[-1][1] in [1, 2]:
             return "雙跳型態", "中"
+
     alt = alternation_count(seq[-5:] if len(seq) >= 5 else seq)
     if len(seq) >= 4 and alt >= len((seq[-5:] if len(seq) >= 5 else seq)) - 1:
         return "單跳型態", "中"
+
     if len(segs) >= 2 and segs[-1][1] == segs[-2][1] and segs[-1][0] != segs[-2][0]:
         return "齊頭型態", "中高"
+
     return "混合型態", "高"
 
 
@@ -439,50 +466,40 @@ def pattern_percentages(road):
         "player_pct": player_pct,
         "pattern": pattern,
         "risk": risk,
-        "counts": {"莊": banker, "閒": player, "交錯": alt, "最長連續": longest},
+        "counts": {
+            "莊": banker,
+            "閒": player,
+            "交錯": alt,
+            "最長連續": longest,
+        },
     }
 
 
 def probability_card(road):
     seq = filter_main_road(road)[-10:]
     data = pattern_percentages(road)
+
     return (
-        "📊 目前牌路分析
-
-"
-        f"牌路：
-{road_text(seq)}
-
-"
-        "模型判讀：
-"
-        f"👉 莊：{data['banker_pct']}%
-"
-        f"👉 閒：{data['player_pct']}%
-
-"
-        "節奏：
-"
-        f"👉 {data['pattern']}
-
-"
-        "補充統計：
-"
-        f"莊：{data['counts']['莊']}
-"
-        f"閒：{data['counts']['閒']}
-"
-        f"交錯次數：{data['counts']['交錯']}
-"
-        f"最長連續：{data['counts']['最長連續']}
-
-"
-        "風險：
-"
+        "📊 目前牌路分析\n\n"
+        f"牌路：\n{road_text(seq)}\n\n"
+        "模型判讀：\n"
+        f"👉 莊：{data['banker_pct']}%\n"
+        f"👉 閒：{data['player_pct']}%\n\n"
+        "節奏：\n"
+        f"👉 {data['pattern']}\n\n"
+        "補充統計：\n"
+        f"莊：{data['counts']['莊']}\n"
+        f"閒：{data['counts']['閒']}\n"
+        f"交錯次數：{data['counts']['交錯']}\n"
+        f"最長連續：{data['counts']['最長連續']}\n\n"
+        "風險：\n"
         f"{data['risk']}"
     )
 
 
+# =========================
+# Analysis logs / backtest
+# =========================
 def create_analysis_log(line_user_id: str, road):
     data = pattern_percentages(road)
     with get_conn() as conn:
@@ -509,11 +526,13 @@ def create_analysis_log(line_user_id: str, road):
 def backfill_previous_actual(line_user_id: str, actual_result: str):
     if actual_result not in ["莊", "閒"]:
         return
+
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT id FROM analysis_logs
+                SELECT id
+                FROM analysis_logs
                 WHERE line_user_id = %s
                   AND actual_next_result IS NULL
                 ORDER BY created_at DESC
@@ -522,6 +541,7 @@ def backfill_previous_actual(line_user_id: str, actual_result: str):
                 (line_user_id,),
             )
             row = cur.fetchone()
+
             if row:
                 cur.execute(
                     """
@@ -555,9 +575,9 @@ def hit_rate_summary(line_user_id: str):
 
     total = 0
     hit = 0
-    for r in rows:
-        predicted = "莊" if r["banker_pct"] >= r["player_pct"] else "閒"
-        if predicted == r["actual_next_result"]:
+    for row in rows:
+        predicted = "莊" if row["banker_pct"] >= row["player_pct"] else "閒"
+        if predicted == row["actual_next_result"]:
             hit += 1
         total += 1
 
@@ -565,36 +585,31 @@ def hit_rate_summary(line_user_id: str):
     return f"近{total}筆回測命中：{rate}%"
 
 
+# =========================
+# Status / road ops
+# =========================
 def get_status_text(user):
     if is_vip(user):
         mins = minutes_left(user["vip_expire_at"])
         days = mins // 1440
         return (
-            "目前狀態：VIP
-
-"
-            f"到期時間：{user['vip_expire_at']}
-"
+            "目前狀態：VIP\n\n"
+            f"到期時間：{user['vip_expire_at']}\n"
             f"剩餘：約 {days} 天"
         )
+
     if in_trial(user):
         mins = minutes_left(user["trial_end_at"])
         return (
-            "目前狀態：免費試用中
-
-"
-            f"剩餘時間：約 {mins} 分鐘
-"
+            "目前狀態：免費試用中\n\n"
+            f"剩餘時間：約 {mins} 分鐘\n"
             "試用結束後，完整分析需開通VIP。"
         )
-    return (
-        "試用已結束
 
-"
-        "VIP開通：
-"
-        "👉 註冊3A帳號 / 已有3A帳號
-"
+    return (
+        "試用已結束\n\n"
+        "VIP開通：\n"
+        "👉 註冊3A帳號 / 已有3A帳號\n"
         "👉 聯絡管理員"
     )
 
@@ -604,6 +619,7 @@ def add_result(line_user_id: str, result: str):
     road = user["current_road"] or []
     road.append(result)
     road = road[-MAX_ROAD:]
+
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -640,28 +656,21 @@ def clear_road(line_user_id: str):
 def menu_text(user):
     tag = "VIP會員" if is_vip(user) else ("免費試用中" if in_trial(user) else "免費版")
     return (
-        f"歡迎使用百家即時分析助手（{tag}）
-
-"
-        "可直接輸入：
-"
-        "莊 / 閒 / 和
-
-"
-        "常用功能：
-"
-        "牌路
-"
-        "分析
-"
-        "重設
-"
-        "綁定帳號
-"
+        f"歡迎使用百家即時分析助手（{tag}）\n\n"
+        "可直接輸入：\n"
+        "莊 / 閒 / 和\n\n"
+        "常用功能：\n"
+        "牌路\n"
+        "分析\n"
+        "重設\n"
+        "綁定帳號\n"
         "查詢資格"
     )
 
 
+# =========================
+# Routes
+# =========================
 @app.route("/", methods=["GET"])
 def home():
     return "Bot running", 200
@@ -718,15 +727,20 @@ def callback():
         touch_user(user_id)
         user = get_user(user_id)
 
+        # =========================
+        # Admin commands
+        # =========================
         if user_id in ADMIN_USER_IDS and text == "/待開通":
             pending = list_pending_accounts()
             if not pending:
                 reply_message(reply_token, "目前沒有待開通名單。", quick_items=base_quick_reply(True))
             else:
                 rows = [f"{i}. {row['game_account']}" for i, row in enumerate(pending[:20], start=1)]
-                reply_message(reply_token, "待開通名單：
-" + "
-".join(rows), quick_items=base_quick_reply(True))
+                reply_message(
+                    reply_token,
+                    "待開通名單：\n" + "\n".join(rows),
+                    quick_items=base_quick_reply(True),
+                )
             continue
 
         if user_id in ADMIN_USER_IDS and text.startswith("/vip "):
@@ -734,32 +748,26 @@ def callback():
             if len(parts) != 3:
                 reply_message(reply_token, "格式錯誤，請用：/vip 遊戲帳號 天數", quick_items=base_quick_reply(True))
                 continue
+
             game_account = parts[1]
             try:
                 days = int(parts[2])
             except ValueError:
                 reply_message(reply_token, "天數請輸入數字，例如：/vip ck76888 30", quick_items=base_quick_reply(True))
                 continue
+
             updated_user, err = grant_vip_by_game_account(game_account, days)
             if err:
                 reply_message(reply_token, err, quick_items=base_quick_reply(True))
             else:
                 reply_message(
                     reply_token,
-                    f"已開通VIP
-
-帳號：{game_account}
-天數：{days}天
-到期：{updated_user['vip_expire_at']}",
+                    f"已開通VIP\n\n帳號：{game_account}\n天數：{days}天\n到期：{updated_user['vip_expire_at']}",
                     quick_items=base_quick_reply(True),
                 )
                 push_message(
                     updated_user["line_user_id"],
-                    f"你的VIP已開通
-
-到期時間：{updated_user['vip_expire_at']}
-
-現在可使用完整分析功能。",
+                    f"你的VIP已開通\n\n到期時間：{updated_user['vip_expire_at']}\n\n現在可使用完整分析功能。",
                 )
             continue
 
@@ -768,84 +776,123 @@ def callback():
             if len(parts) != 2:
                 reply_message(reply_token, "格式錯誤，請用：/unvip 遊戲帳號", quick_items=base_quick_reply(True))
                 continue
+
             ok = revoke_vip_by_game_account(parts[1])
-            reply_message(reply_token, f"已取消VIP：{parts[1]}" if ok else "找不到這個遊戲帳號。", quick_items=base_quick_reply(True))
+            reply_message(
+                reply_token,
+                f"已取消VIP：{parts[1]}" if ok else "找不到這個遊戲帳號。",
+                quick_items=base_quick_reply(True),
+            )
             continue
 
+        # =========================
+        # Bind flow
+        # =========================
         if user.get("pending_flow") == "bind_game_account":
             ok = set_game_account(user_id, text)
             if ok:
                 reply_message(
                     reply_token,
-                    f"已收到你的遊戲帳號：{text}
-
-請等待管理員確認開通VIP。",
+                    f"已收到你的遊戲帳號：{text}\n\n請等待管理員確認開通VIP。",
                     quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
                 )
             else:
-                reply_message(reply_token, "這個遊戲帳號可能已被綁定，請換一個或聯絡管理員。", quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+                reply_message(
+                    reply_token,
+                    "這個遊戲帳號可能已被綁定，請換一個或聯絡管理員。",
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                )
             continue
 
+        # =========================
+        # Trial / VIP lock
+        # =========================
         if not is_vip(user) and not in_trial(user):
             if text in ["分析", "牌路", "莊", "閒", "和"]:
-                reply_message(reply_token, get_status_text(user), quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+                reply_message(
+                    reply_token,
+                    get_status_text(user),
+                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+                )
                 continue
 
+        # =========================
+        # General commands
+        # =========================
         if text == "開始":
-            reply_message(reply_token, menu_text(user), quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                menu_text(user),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         if text == "綁定帳號":
             set_pending_flow(user_id, "bind_game_account")
-            reply_message(reply_token, "請輸入你的遊戲帳號
-例如：ck76888", quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                "請輸入你的遊戲帳號\n例如：ck76888",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         if text == "查詢資格":
-            reply_message(reply_token, get_status_text(user), quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                get_status_text(user),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         if text in ["莊", "閒", "和"]:
-            # 先把上一筆未驗證分析補上實際下一口
             backfill_previous_actual(user_id, text)
             user = add_result(user_id, text)
-            # 再為目前這口生成新的分析記錄，等下一口驗證
             create_analysis_log(user_id, user["current_road"] or [])
             card = probability_card(user["current_road"] or [])
-            if is_vip(get_user(user_id)):
-                card += "
+            latest_user = get_user(user_id)
+            if is_vip(latest_user):
+                card += "\n\n" + hit_rate_summary(user_id)
 
-" + hit_rate_summary(user_id)
-            reply_message(reply_token, f"已記錄：{text}
-
-{card}", quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                f"已記錄：{text}\n\n{card}",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         if text == "牌路":
             limit = 20 if is_vip(user) else 8
-            reply_message(reply_token, f"目前牌路：
-{road_text(user['current_road'] or [], limit)}", quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                f"目前牌路：\n{road_text(user['current_road'] or [], limit)}",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         if text == "分析":
             card = probability_card(user["current_road"] or [])
             if is_vip(user):
-                card += "
+                card += "\n\n" + hit_rate_summary(user_id)
 
-" + hit_rate_summary(user_id)
-            reply_message(reply_token, card, quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                card,
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         if text == "重設":
             clear_road(user_id)
-            reply_message(reply_token, "已重設當前牌路。", quick_items=base_quick_reply(user_id in ADMIN_USER_IDS))
+            reply_message(
+                reply_token,
+                "已重設當前牌路。",
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
+            )
             continue
 
         reply_message(
             reply_token,
-            f"你剛剛說：{text}
-
-可用功能：開始 / 分析 / 牌路 / 綁定帳號 / 查詢資格 / 重設",
+            f"你剛剛說：{text}\n\n可用功能：開始 / 分析 / 牌路 / 綁定帳號 / 查詢資格 / 重設",
             quick_items=base_quick_reply(user_id in ADMIN_USER_IDS),
         )
 
