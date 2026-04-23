@@ -171,12 +171,16 @@ def push_message(user_id: str, text: str):
 def get_user(line_user_id: str):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users WHERE line_user_id = %s", (line_user_id,))
+            cur.execute(
+                "SELECT * FROM users WHERE line_user_id = %s",
+                (line_user_id,),
+            )
             return cur.fetchone()
 
 
 def ensure_user(line_user_id: str):
     user = get_user(line_user_id)
+
     if user:
         last_active = user["last_active_at"]
         if last_active and (now_tw() - last_active > timedelta(minutes=TIMEOUT_MINUTES)):
@@ -185,14 +189,20 @@ def ensure_user(line_user_id: str):
                     cur.execute(
                         """
                         UPDATE users
-                        SET current_road = '[]'::jsonb,
-                            analysis_active = FALSE,
-                            imported_ready = FALSE,
+                        SET current_road = %s::jsonb,
+                            analysis_active = %s,
+                            imported_ready = %s,
                             updated_at = %s
                         WHERE line_user_id = %s
                         RETURNING *
                         """,
-                        (now_tw(), line_user_id),
+                        (
+                            json.dumps([], ensure_ascii=False),
+                            False,
+                            False,
+                            now_tw(),
+                            line_user_id,
+                        ),
                     )
                     user = cur.fetchone()
                 conn.commit()
@@ -203,16 +213,26 @@ def ensure_user(line_user_id: str):
             cur.execute(
                 """
                 INSERT INTO users (
-                    line_user_id, trial_end_at, current_road, pending_flow,
-                    analysis_active, imported_ready, last_active_at, created_at, updated_at
+                    line_user_id,
+                    trial_end_at,
+                    current_road,
+                    pending_flow,
+                    analysis_active,
+                    imported_ready,
+                    last_active_at,
+                    created_at,
+                    updated_at
                 )
-                VALUES (%s, %s, '[]'::jsonb, NULL, FALSE, FALSE, %s, %s, %s)
+                VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (
                     line_user_id,
                     now_tw() + timedelta(hours=3),
-                    now_tw(),
+                    json.dumps([], ensure_ascii=False),
+                    None,
+                    False,
+                    False,
                     now_tw(),
                     now_tw(),
                     now_tw(),
@@ -224,55 +244,71 @@ def ensure_user(line_user_id: str):
 
 
 def update_user_fields(line_user_id: str, **fields):
-    if not fields:
-        return get_user(line_user_id)
+    current = get_user(line_user_id)
+    if not current:
+        ensure_user(line_user_id)
+        current = get_user(line_user_id)
 
-    allowed = {
-        "game_account",
-        "vip_expire_at",
-        "trial_end_at",
-        "current_road",
-        "pending_flow",
-        "analysis_active",
-        "imported_ready",
-        "last_active_at",
-        "updated_at",
-    }
-
-    set_parts = []
-    values = []
-
-    for key, value in fields.items():
-        if key not in allowed:
-            continue
-        if key == "current_road":
-            set_parts.append(f"{key} = %s::jsonb")
-            values.append(json.dumps(value, ensure_ascii=False))
-        else:
-            set_parts.append(f"{key} = %s")
-            values.append(value)
-
-    set_parts.append("updated_at = %s")
-    values.append(now_tw())
-    values.append(line_user_id)
-
-    sql = f"""
-    UPDATE users
-    SET {", ".join(set_parts)}
-    WHERE line_user_id = %s
-    RETURNING *
-    """
+    game_account = fields.get("game_account", current.get("game_account"))
+    vip_expire_at = fields.get("vip_expire_at", current.get("vip_expire_at"))
+    trial_end_at = fields.get("trial_end_at", current.get("trial_end_at"))
+    current_road = fields.get("current_road", current.get("current_road") or [])
+    pending_flow = fields.get("pending_flow", current.get("pending_flow"))
+    analysis_active = fields.get("analysis_active", current.get("analysis_active", False))
+    imported_ready = fields.get("imported_ready", current.get("imported_ready", False))
+    last_active_at = fields.get("last_active_at", current.get("last_active_at"))
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, tuple(values))
+            cur.execute(
+                """
+                UPDATE users
+                SET game_account = %s,
+                    vip_expire_at = %s,
+                    trial_end_at = %s,
+                    current_road = %s::jsonb,
+                    pending_flow = %s,
+                    analysis_active = %s,
+                    imported_ready = %s,
+                    last_active_at = %s,
+                    updated_at = %s
+                WHERE line_user_id = %s
+                RETURNING *
+                """,
+                (
+                    game_account,
+                    vip_expire_at,
+                    trial_end_at,
+                    json.dumps(current_road, ensure_ascii=False),
+                    pending_flow,
+                    analysis_active,
+                    imported_ready,
+                    last_active_at,
+                    now_tw(),
+                    line_user_id,
+                ),
+            )
             row = cur.fetchone()
         conn.commit()
         return row
 
 
 def touch_user(line_user_id: str):
-    return update_user_fields(line_user_id, last_active_at=now_tw())
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET last_active_at = %s,
+                    updated_at = %s
+                WHERE line_user_id = %s
+                RETURNING *
+                """,
+                (now_tw(), now_tw(), line_user_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return row
 
 
 def is_vip(user) -> bool:
