@@ -129,7 +129,7 @@ def base_quick_reply(is_admin=False, analysis_active=False):
             ("匯入牌路", "匯入牌路"),
             ("開始分析", "開始分析"),
             ("牌路", "牌路"),
-            ("分析", "分析"),
+            ("會員說明", "會員說明"),
             ("綁定帳號", "綁定帳號"),
         ]
     if is_admin:
@@ -395,7 +395,9 @@ def filter_main_road(road):
 
 
 def normalize_input_road(raw: str):
-    raw = raw.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    raw = raw.strip().replace(" ", "").replace("
+", "").replace("
+", "")
     tokens = []
     i = 0
     while i < len(raw):
@@ -446,108 +448,394 @@ def alternation_count(seq):
     return cnt
 
 
-def classify_pattern(seq):
-    if len(seq) < 2:
-        return "資料不足", "高"
+def longest_run(seq):
+    return max((c for _, c in segment_lengths(seq)), default=0)
 
-    tail_count, _ = count_tail_same(seq)
+
+def avg_segment_length(seq):
+    segs = segment_lengths(seq)
+    if not segs:
+        return 0
+    return round(len(seq) / len(segs), 2)
+
+
+def transition_rate(seq):
+    if len(seq) <= 1:
+        return 0
+    return round(alternation_count(seq) * 100 / (len(seq) - 1))
+
+
+# =========================
+# V3.5 Prediction Engine
+# =========================
+def sequence_match_model(seq, max_window=6):
+    details = []
+    bonus_b = 0.0
+    bonus_p = 0.0
+    total_matches = 0
+    best_line = "無明顯相似序列"
+
+    if len(seq) < 8:
+        return bonus_b, bonus_p, total_matches, best_line, details
+
+    for window in range(min(max_window, len(seq) - 1), 2, -1):
+        pattern = seq[-window:]
+        b_next = 0
+        p_next = 0
+        matches = 0
+
+        for i in range(0, len(seq) - window):
+            past = seq[i:i + window]
+            if past == pattern and i + window < len(seq):
+                nxt = seq[i + window]
+                if nxt == "莊":
+                    b_next += 1
+                    matches += 1
+                elif nxt == "閒":
+                    p_next += 1
+                    matches += 1
+
+        if matches > 0:
+            weight = {6: 20, 5: 16, 4: 12, 3: 8}.get(window, 6)
+            b_ratio = b_next / matches
+            p_ratio = p_next / matches
+            bonus_b += weight * b_ratio
+            bonus_p += weight * p_ratio
+            total_matches += matches
+            details.append(f"{window}碼匹配「{''.join(pattern)}」：莊{b_next} / 閒{p_next}")
+            if best_line == "無明顯相似序列":
+                best_line = f"尾段「{''.join(pattern)}」曾出現 {matches} 次"
+
+    return bonus_b, bonus_p, total_matches, best_line, details[:3]
+
+
+def tail_momentum_model(seq):
+    bonus_b = 0.0
+    bonus_p = 0.0
+    label = "尾段資料不足"
+
+    if len(seq) < 3:
+        return bonus_b, bonus_p, label
+
+    tail_count, tail_side = count_tail_same(seq)
+
     if tail_count >= 5:
-        return "長連續型", "中低"
+        if tail_side == "莊":
+            bonus_b += 9
+            bonus_p += 5
+        else:
+            bonus_p += 9
+            bonus_b += 5
+        label = f"尾段{tail_count}連{tail_side}，延續與轉折同時升高"
+    elif tail_count >= 3:
+        if tail_side == "莊":
+            bonus_b += 14
+        else:
+            bonus_p += 14
+        label = f"尾段{tail_count}連{tail_side}，延續動能偏強"
+    elif tail_count == 2:
+        if tail_side == "莊":
+            bonus_b += 7
+        else:
+            bonus_p += 7
+        label = f"尾段2連{tail_side}，連續正在建立"
+    else:
+        last5 = seq[-5:] if len(seq) >= 5 else seq
+        alt = alternation_count(last5)
+        if len(last5) >= 4 and alt >= len(last5) - 1:
+            next_side = "閒" if seq[-1] == "莊" else "莊"
+            if next_side == "莊":
+                bonus_b += 12
+            else:
+                bonus_p += 12
+            label = "尾段交錯明顯，單跳動能偏強"
+        else:
+            label = "尾段未形成強動能"
+
+    return bonus_b, bonus_p, label
+
+
+def structure_model(seq):
+    bonus_b = 0.0
+    bonus_p = 0.0
+    label = "混合結構"
+
+    if len(seq) < 4:
+        return bonus_b, bonus_p, label
 
     segs = segment_lengths(seq)
+    tail_count, tail_side = count_tail_same(seq)
+
+    # 單跳
+    last5 = seq[-5:] if len(seq) >= 5 else seq
+    if len(last5) >= 4 and alternation_count(last5) >= len(last5) - 1:
+        next_side = "閒" if seq[-1] == "莊" else "莊"
+        if next_side == "莊":
+            bonus_b += 12
+        else:
+            bonus_p += 12
+        label = "單跳型態"
+        return bonus_b, bonus_p, label
+
+    # 單跳破壞
+    if len(seq) >= 6:
+        last6 = seq[-6:]
+        if (
+            last6[0] != last6[1]
+            and last6[1] != last6[2]
+            and last6[2] != last6[3]
+            and last6[3] != last6[4]
+            and last6[4] == last6[5]
+        ):
+            rebound = "閒" if last6[-1] == "莊" else "莊"
+            if rebound == "莊":
+                bonus_b += 14
+            else:
+                bonus_p += 14
+            label = "單跳破壞後回補觀察"
+            return bonus_b, bonus_p, label
+
+    # 雙跳
     if len(segs) >= 4:
         tail = segs[-4:]
         if all(c == 2 for _, c in tail[:-1]) and tail[-1][1] in [1, 2]:
-            return "雙跳型態", "中"
+            expected_side = tail[-1][0] if tail[-1][1] == 1 else ("閒" if tail[-1][0] == "莊" else "莊")
+            if expected_side == "莊":
+                bonus_b += 13
+            else:
+                bonus_p += 13
+            label = "雙跳型態"
+            return bonus_b, bonus_p, label
 
-    alt = alternation_count(seq[-5:] if len(seq) >= 5 else seq)
-    if len(seq) >= 4 and alt >= len((seq[-5:] if len(seq) >= 5 else seq)) - 1:
-        return "單跳型態", "中"
+    # 長連續
+    if tail_count >= 5:
+        if tail_side == "莊":
+            bonus_b += 10
+            bonus_p += 5
+        else:
+            bonus_p += 10
+            bonus_b += 5
+        label = "長連續型態"
+        return bonus_b, bonus_p, label
 
+    # 齊頭
     if len(segs) >= 2 and segs[-1][1] == segs[-2][1] and segs[-1][0] != segs[-2][0]:
-        return "齊頭型態", "中高"
+        next_side = segs[-2][0]
+        if next_side == "莊":
+            bonus_b += 13
+        else:
+            bonus_p += 13
+        label = "齊頭型態"
+        return bonus_b, bonus_p, label
 
-    return "混合型態", "高"
+    # 段落偏向
+    if tail_count >= 2:
+        if tail_side == "莊":
+            bonus_b += 5
+        else:
+            bonus_p += 5
+        label = "短連續建立"
+
+    return bonus_b, bonus_p, label
 
 
-def pattern_percentages(road):
-    seq = filter_main_road(road)[-10:]
+def recency_weight_model(seq):
+    bonus_b = 0.0
+    bonus_p = 0.0
+    last = seq[-8:] if len(seq) >= 8 else seq
+    weights = list(range(1, len(last) + 1))
+    for x, w in zip(last, weights):
+        if x == "莊":
+            bonus_b += w * 0.7
+        elif x == "閒":
+            bonus_p += w * 0.7
+    label = "近期權重已套用"
+    return bonus_b, bonus_p, label
+
+
+def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label):
+    gap = abs(banker_pct - player_pct)
+    t_rate = transition_rate(seq)
+    avg_len = avg_segment_length(seq)
+
+    if gap >= 22 and total_matches >= 2:
+        signal = "強"
+    elif gap >= 14 or total_matches >= 1:
+        signal = "中強"
+    elif gap >= 8:
+        signal = "中"
+    else:
+        signal = "弱"
+
+    if len(seq) < 15:
+        risk = "中高"
+    elif "混合" in structure_label and gap < 10:
+        risk = "高"
+    elif t_rate > 75 or avg_len < 1.35:
+        risk = "中高"
+    elif gap >= 18 and signal in ["強", "中強"]:
+        risk = "中低"
+    else:
+        risk = "中"
+
+    return signal, risk
+
+
+def prediction_v35(road):
+    seq = filter_main_road(road)[-30:]
     if not seq:
         return {
             "banker_pct": 50,
             "player_pct": 50,
             "pattern": "資料不足",
             "risk": "高",
-            "counts": {"莊": 0, "閒": 0, "交錯": 0, "最長連續": 0},
+            "signal": "弱",
+            "tail_note": "尚無尾段資料",
+            "match_note": "尚無匹配資料",
+            "structure_note": "尚無結構資料",
+            "match_details": [],
+            "metrics": {
+                "莊": 0,
+                "閒": 0,
+                "交錯率": 0,
+                "平均段長": 0,
+                "最長連續": 0,
+            },
         }
 
+    # 基礎比例，避免固定 50，低權重但保留背景
     banker = seq.count("莊")
     player = seq.count("閒")
-    alt = alternation_count(seq)
-    segs = segment_lengths(seq)
-    longest = max((c for _, c in segs), default=0)
-    tail_count, tail_side = count_tail_same(seq)
+    score_b = 40 + banker * 2.8
+    score_p = 40 + player * 2.8
 
-    banker_score = banker * 10
-    player_score = player * 10
+    rb, rp, recency_note = recency_weight_model(seq)
+    score_b += rb
+    score_p += rp
 
-    if tail_side == "莊":
-        banker_score += min(tail_count * 4, 16)
-    elif tail_side == "閒":
-        player_score += min(tail_count * 4, 16)
+    tb, tp, tail_note = tail_momentum_model(seq)
+    score_b += tb
+    score_p += tp
 
-    if alt >= max(3, len(seq) - 2):
-        if seq[-1] == "莊":
-            player_score += 12
+    sb, sp, structure_note = structure_model(seq)
+    score_b += sb
+    score_p += sp
+
+    mb, mp, total_matches, match_note, match_details = sequence_match_model(seq, max_window=6)
+    score_b += mb
+    score_p += mp
+
+    # 波動微調：細微變動也會影響百分比
+    t_rate = transition_rate(seq)
+    avg_len = avg_segment_length(seq)
+    if t_rate >= 65:
+        # 高交錯時，尾端反向微增
+        next_side = "閒" if seq[-1] == "莊" else "莊"
+        if next_side == "莊":
+            score_b += 4
         else:
-            banker_score += 12
+            score_p += 4
+    if avg_len >= 2.2:
+        tail_count, tail_side = count_tail_same(seq)
+        if tail_side == "莊":
+            score_b += 3
+        elif tail_side == "閒":
+            score_p += 3
 
-    if len(segs) >= 4:
-        tail = segs[-4:]
-        if len(tail) == 4 and all(c == 2 for _, c in tail[:-1]):
-            expected_side = tail[-1][0] if tail[-1][1] == 1 else ("閒" if tail[-1][0] == "莊" else "莊")
-            if expected_side == "莊":
-                banker_score += 10
-            else:
-                player_score += 10
-
-    total = max(banker_score + player_score, 1)
-    banker_pct = round(banker_score * 100 / total)
+    total = max(score_b + score_p, 1)
+    banker_pct = round(score_b * 100 / total)
     player_pct = 100 - banker_pct
-    pattern, risk = classify_pattern(seq)
+
+    signal, risk = risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_note)
 
     return {
         "banker_pct": banker_pct,
         "player_pct": player_pct,
-        "pattern": pattern,
+        "pattern": structure_note,
         "risk": risk,
-        "counts": {
+        "signal": signal,
+        "tail_note": tail_note,
+        "match_note": match_note,
+        "structure_note": structure_note,
+        "match_details": match_details,
+        "metrics": {
             "莊": banker,
             "閒": player,
-            "交錯": alt,
-            "最長連續": longest,
+            "交錯率": t_rate,
+            "平均段長": avg_len,
+            "最長連續": longest_run(seq),
         },
     }
 
 
-def probability_card(road):
-    seq = filter_main_road(road)[-10:]
-    data = pattern_percentages(road)
+def prediction_card(road):
+    seq = filter_main_road(road)[-30:]
+    data = prediction_v35(road)
+    detail_lines = "
+".join([f"・{x}" for x in data["match_details"]]) if data["match_details"] else "・目前無足夠重複樣本"
 
     return (
-        "📊 目前牌路分析\n\n"
-        f"牌路：\n{road_text(seq)}\n\n"
-        "模型判讀：\n"
-        f"👉 莊：{data['banker_pct']}%\n"
-        f"👉 閒：{data['player_pct']}%\n\n"
-        "節奏：\n"
-        f"👉 {data['pattern']}\n\n"
-        "補充統計：\n"
-        f"莊：{data['counts']['莊']}\n"
-        f"閒：{data['counts']['閒']}\n"
-        f"交錯次數：{data['counts']['交錯']}\n"
-        f"最長連續：{data['counts']['最長連續']}\n\n"
-        "風險：\n"
+        "📊 預測判讀 V3.5
+
+"
+        f"目前牌路：
+{road_text(seq[-20:])}
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "預測機率：
+"
+        f"👉 莊：{data['banker_pct']}%
+"
+        f"👉 閒：{data['player_pct']}%
+
+"
+        f"信號強度：{data['signal']}
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "判斷依據：
+
+"
+        "▍序列匹配
+"
+        f"{data['match_note']}
+"
+        f"{detail_lines}
+
+"
+        "▍尾段動能
+"
+        f"{data['tail_note']}
+
+"
+        "▍結構判斷
+"
+        f"{data['structure_note']}
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "數據指標：
+"
+        f"莊：{data['metrics']['莊']}
+"
+        f"閒：{data['metrics']['閒']}
+"
+        f"交錯率：{data['metrics']['交錯率']}%
+"
+        f"平均段長：{data['metrics']['平均段長']}
+"
+        f"最長連續：{data['metrics']['最長連續']}
+
+"
+        "風險：
+"
         f"{data['risk']}"
     )
 
@@ -556,7 +844,7 @@ def probability_card(road):
 # Backtest logs
 # =========================
 def create_analysis_log(line_user_id: str, road):
-    data = pattern_percentages(road)
+    data = prediction_v35(road)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -568,7 +856,7 @@ def create_analysis_log(line_user_id: str, road):
                 """,
                 (
                     line_user_id,
-                    json.dumps(filter_main_road(road)[-10:], ensure_ascii=False),
+                    json.dumps(filter_main_road(road)[-30:], ensure_ascii=False),
                     data["banker_pct"],
                     data["player_pct"],
                     data["pattern"],
@@ -647,40 +935,189 @@ def get_status_text(user):
         mins = minutes_left(user["vip_expire_at"])
         days = mins // 1440
         return (
-            "目前狀態：VIP\n\n"
-            f"到期時間：{user['vip_expire_at']}\n"
+            "目前狀態：VIP
+
+"
+            f"到期時間：{user['vip_expire_at']}
+"
             f"剩餘：約 {days} 天"
         )
 
     if in_trial(user):
         mins = minutes_left(user["trial_end_at"])
         return (
-            "目前狀態：免費試用中\n\n"
-            f"剩餘時間：約 {mins} 分鐘\n"
+            "目前狀態：免費試用中
+
+"
+            f"剩餘時間：約 {mins} 分鐘
+"
             "試用結束後，完整分析需開通VIP。"
         )
 
     return (
-        "試用已結束\n\n"
-        "VIP開通：\n"
-        "👉 註冊3A帳號 / 已有3A帳號\n"
+        "試用已結束
+
+"
+        "VIP開通：
+"
+        "👉 註冊3A帳號 / 已有3A帳號
+"
         "👉 聯絡管理員"
+    )
+
+
+def member_guide_text():
+    return (
+        "【使用教學】
+
+"
+        "本系統為「牌路紀錄＋即時分析」模式
+"
+        "請依照以下流程操作：
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "① 綁定帳號
+"
+        "點選【綁定帳號】
+"
+        "輸入你的遊戲帳號（例：ck76888）
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "② 匯入牌路
+"
+        "輸入目前牌路
+"
+        "（需至少15把以上）
+
+"
+        "例：
+"
+        "莊莊莊閒莊閒閒莊…
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "③ 開始分析
+"
+        "點選【開始分析】
+"
+        "系統會進入即時模式
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "④ 即時紀錄
+"
+        "每開一把輸入：
+
+"
+        "👉 莊
+"
+        "👉 閒
+"
+        "👉 和
+
+"
+        "系統會同步更新分析
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "⑤ 結束分析
+"
+        "輸入【結束分析】
+"
+        "結算本局紀錄
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        "⚠️ 未開通VIP將無法使用完整分析功能
+"
+        "請先綁定帳號並聯絡管理員開通
+
+"
+        "━━━━━━━━━━━━━━━
+"
+        "【開通教學】
+
+"
+        "Step1
+"
+        "請由以下入口完成註冊：
+"
+        "sn043.aaawin88.com
+
+"
+        "👉已有帳號者請跳至 Step 5
+
+"
+        "Step 2
+"
+        "請先點選下方【綁定帳號】
+
+"
+        "Step 3
+"
+        "輸入你的遊戲帳號
+"
+        "例如：ck76888
+
+"
+        "Step 4
+"
+        "送出後，系統會將你的資料列入待開通名單
+
+"
+        "Step 5
+"
+        "聯絡管理員確認開通狀態
+
+"
+        "開通完成後，即可使用完整分析功能。
+
+"
+        "※ 實際資格、發放方式及相關規範，請以平台公告為準。"
     )
 
 
 def menu_text(user):
     tag = "VIP會員" if is_vip(user) else ("免費試用中" if in_trial(user) else "免費版")
     return (
-        f"歡迎使用百家即時分析助手（{tag}）\n\n"
-        "可用流程：\n"
-        "1. 匯入牌路\n"
-        "2. 開始分析\n"
-        "3. 分析中逐口按 莊 / 閒 / 和\n"
-        "4. 結束分析\n\n"
-        "常用功能：\n"
-        "牌路\n"
-        "分析\n"
-        "綁定帳號\n"
+        f"歡迎使用百家即時分析助手（{tag}）
+
+"
+        "可用流程：
+"
+        "1. 匯入牌路
+"
+        "2. 開始分析
+"
+        "3. 分析中逐口按 莊 / 閒 / 和
+"
+        "4. 結束分析
+
+"
+        "常用功能：
+"
+        "牌路
+"
+        "分析
+"
+        "會員說明
+"
+        "綁定帳號
+"
         "查詢資格"
     )
 
@@ -753,7 +1190,9 @@ def callback():
                 rows = [f"{i}. {row['game_account']}" for i, row in enumerate(pending[:20], start=1)]
                 reply_message(
                     reply_token,
-                    "待開通名單：\n" + "\n".join(rows),
+                    "待開通名單：
+" + "
+".join(rows),
                     quick_items=base_quick_reply(True, user["analysis_active"]),
                 )
             continue
@@ -777,12 +1216,20 @@ def callback():
             else:
                 reply_message(
                     reply_token,
-                    f"已開通VIP\n\n帳號：{game_account}\n天數：{days}天\n到期：{updated_user['vip_expire_at']}",
+                    f"已開通VIP
+
+帳號：{game_account}
+天數：{days}天
+到期：{updated_user['vip_expire_at']}",
                     quick_items=base_quick_reply(True, user["analysis_active"]),
                 )
                 push_message(
                     updated_user["line_user_id"],
-                    f"你的VIP已開通\n\n到期時間：{updated_user['vip_expire_at']}\n\n現在可使用完整分析功能。",
+                    f"你的VIP已開通
+
+到期時間：{updated_user['vip_expire_at']}
+
+現在可使用完整分析功能。",
                 )
             continue
 
@@ -806,7 +1253,9 @@ def callback():
             if ok:
                 reply_message(
                     reply_token,
-                    f"已收到你的遊戲帳號：{text}\n\n請等待管理員確認開通VIP。",
+                    f"已收到你的遊戲帳號：{text}
+
+請等待管理員確認開通VIP。",
                     quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
                 )
             else:
@@ -836,11 +1285,20 @@ def callback():
             )
             continue
 
+        if text in ["會員說明", "使用教學", "開通教學"]:
+            reply_message(
+                reply_token,
+                member_guide_text(),
+                quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
+            )
+            continue
+
         if text == "綁定帳號":
             update_user_fields(user_id, pending_flow="bind_game_account")
             reply_message(
                 reply_token,
-                "請輸入你的遊戲帳號\n例如：ck76888",
+                "請輸入你的遊戲帳號
+例如：ck76888",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
             )
             continue
@@ -857,7 +1315,11 @@ def callback():
             update_user_fields(user_id, pending_flow="import_road")
             reply_message(
                 reply_token,
-                "請一次輸入目前牌路\n格式例如：\n莊莊莊閒莊閒莊閒莊莊閒閒莊閒莊\n\n至少15把才可啟動分析",
+                "請一次輸入目前牌路
+格式例如：
+莊莊莊閒莊閒莊閒莊莊閒閒莊閒莊
+
+至少15把才可啟動分析",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
             )
             continue
@@ -867,7 +1329,8 @@ def callback():
             if not parsed:
                 reply_message(
                     reply_token,
-                    "格式錯誤，請只輸入：莊 / 閒 / 和\n例如：莊莊莊閒莊閒",
+                    "格式錯誤，請只輸入：莊 / 閒 / 和
+例如：莊莊莊閒莊閒",
                     quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
                 )
                 continue
@@ -890,8 +1353,13 @@ def callback():
             imported_user = get_user(user_id)
             reply_message(
                 reply_token,
-                "牌路匯入完成\n\n"
-                f"目前牌路：\n{road_text(imported_user['current_road'])}\n\n"
+                "牌路匯入完成
+
+"
+                f"目前牌路：
+{road_text(imported_user['current_road'])}
+
+"
                 "接下來請輸入：開始分析",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
             )
@@ -908,14 +1376,20 @@ def callback():
 
             user = update_user_fields(user_id, analysis_active=True)
             create_analysis_log(user_id, user["current_road"] or [])
-            card = probability_card(user["current_road"] or [])
+            card = prediction_card(user["current_road"] or [])
             if is_vip(user):
-                card += "\n\n" + hit_rate_summary(user_id)
+                card += "
+
+" + hit_rate_summary(user_id)
 
             reply_message(
                 reply_token,
-                "分析已啟動\n\n"
-                f"{card}\n\n"
+                "分析已啟動
+
+"
+                f"{card}
+
+"
                 "之後每開一口，直接按 莊 / 閒 / 和",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, True),
             )
@@ -930,7 +1404,8 @@ def callback():
             )
             reply_message(
                 reply_token,
-                "已結束本輪分析，牌路已清空。\n如要再次使用，請先重新匯入牌路。",
+                "已結束本輪分析，牌路已清空。
+如要再次使用，請先重新匯入牌路。",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
             )
             continue
@@ -939,7 +1414,11 @@ def callback():
             if not user["analysis_active"]:
                 reply_message(
                     reply_token,
-                    "請先完成：\n1. 匯入牌路\n2. 開始分析\n\n之後再逐口輸入 莊 / 閒 / 和",
+                    "請先完成：
+1. 匯入牌路
+2. 開始分析
+
+之後再逐口輸入 莊 / 閒 / 和",
                     quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, False),
                 )
                 continue
@@ -951,14 +1430,18 @@ def callback():
             user = update_user_fields(user_id, current_road=road)
             create_analysis_log(user_id, user["current_road"] or [])
 
-            card = probability_card(user["current_road"] or [])
+            card = prediction_card(user["current_road"] or [])
             latest_user = get_user(user_id)
             if is_vip(latest_user):
-                card += "\n\n" + hit_rate_summary(user_id)
+                card += "
+
+" + hit_rate_summary(user_id)
 
             reply_message(
                 reply_token,
-                f"已記錄：{text}\n\n{card}",
+                f"已記錄：{text}
+
+{card}",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, True),
             )
             continue
@@ -967,15 +1450,18 @@ def callback():
             limit = 20 if is_vip(user) else 8
             reply_message(
                 reply_token,
-                f"目前牌路：\n{road_text(user['current_road'] or [], limit)}",
+                f"目前牌路：
+{road_text(user['current_road'] or [], limit)}",
                 quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
             )
             continue
 
         if text == "分析":
-            card = probability_card(user["current_road"] or [])
+            card = prediction_card(user["current_road"] or [])
             if is_vip(user):
-                card += "\n\n" + hit_rate_summary(user_id)
+                card += "
+
+" + hit_rate_summary(user_id)
 
             reply_message(
                 reply_token,
@@ -1000,7 +1486,9 @@ def callback():
 
         reply_message(
             reply_token,
-            f"你剛剛說：{text}\n\n可用功能：開始 / 匯入牌路 / 開始分析 / 牌路 / 分析 / 綁定帳號 / 查詢資格 / 結束分析",
+            f"你剛剛說：{text}
+
+可用功能：開始 / 會員說明 / 匯入牌路 / 開始分析 / 牌路 / 分析 / 綁定帳號 / 查詢資格 / 結束分析",
             quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
         )
 
