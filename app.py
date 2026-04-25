@@ -164,7 +164,7 @@ def base_quick_reply(is_admin=False, analysis_active=False):
             ("閒", "閒"),
             ("和", "和"),
             ("分析", "分析"),
-            ("牌路", "牌路"),
+            ("詳細分析", "詳細分析"),
             ("結束分析", "結束分析"),
         ]
     else:
@@ -869,7 +869,7 @@ def prediction_v5(road):
     }
 
 
-def ai_decision_text(data, user):
+def ai_decision_info(data, user):
     gap = abs(data["banker_pct"] - data["player_pct"])
     signal = data["signal"]
     risk = data["risk"]
@@ -877,26 +877,70 @@ def ai_decision_text(data, user):
 
     if gap >= 18 and signal in ["中強", "強"] and risk != "高" and sub_score >= 55:
         status = "✅ 可觀察進場"
-        note = "目前訊號與結構偏一致，可列入觀察。"
+        note = "結構與方向偏一致，可列入觀察。"
     elif gap >= 8 and risk != "高":
         status = "⚠️ 等待確認"
-        note = "目前有方向，但結構仍需要下一口確認。"
+        note = "目前有方向，但仍需要下一口確認。"
     else:
         status = "⛔ 暫停本輪"
-        note = "目前差距不足或風險偏高，建議先觀察。"
+        note = "風險偏高或結構不穩，先觀察。"
 
-    point_line = point_action_line(user, status)
+    return {
+        "status": status,
+        "note": note,
+        "point_line": point_action_line(user, status),
+    }
 
+
+def ai_decision_text(data, user):
+    info = ai_decision_info(data, user)
     return (
         "🧠 AI 決策提示\n\n"
-        f"狀態：{status}\n"
-        f"說明：{note}\n\n"
-        f"{point_line}\n\n"
+        f"狀態：{info['status']}\n"
+        f"說明：{info['note']}\n\n"
+        f"{info['point_line']}\n\n"
         "提醒：此為牌路結構與點數控管提示，請自行控管節奏。"
     )
 
 
+def decision_card(road, user=None):
+    data = prediction_v5(road)
+    user = user or {}
+    info = ai_decision_info(data, user)
+    leader = "莊" if data["banker_pct"] >= data["player_pct"] else "閒"
+    pct = data["banker_pct"] if leader == "莊" else data["player_pct"]
+    sub = data["subroad"]
+
+    return (
+        "🎯 本局方向\n\n"
+        f"👉👉👉 {leader} {pct}% 👈👈👈\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🧠 AI 決策\n\n"
+        f"{info['status']}\n"
+        f"原因：{info['note']}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "⚡ 快速判斷\n\n"
+        f"信號：{data['signal']}\n"
+        f"風險：{data['risk']}\n"
+        f"型態：{data['structure_note']}\n"
+        f"尾段：{data['tail_note']}\n"
+        f"下三路：{sub['big_eye']} / {sub['small']} / {sub['cockroach']}（穩定度{sub['score']}）\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "💰 點數策略\n\n"
+        f"{info['point_line']}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "📌 操作\n\n"
+        "👉 繼續輸入：莊 / 閒 / 和\n"
+        "👉 查看細節：詳細分析\n"
+        "👉 結束本輪：結束分析"
+    )
+
+
 def prediction_card(road, user=None):
+    return decision_card(road, user)
+
+
+def detail_card(road, user=None):
     seq = filter_main_road(road)[-30:]
     data = prediction_v5(road)
 
@@ -908,7 +952,7 @@ def prediction_card(road, user=None):
     sub = data["subroad"]
 
     card = (
-        "📊 預測判讀 V5\n\n"
+        "📊 詳細分析 V5\n\n"
         f"目前牌路：\n{road_text(seq[-20:])}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "預測機率：\n"
@@ -1047,7 +1091,7 @@ def point_config_card(user):
         f"本輪紀錄：{hits}/{total}（{rate}%）\n"
         f"連續順利：{win_streak}\n"
         f"連續失利：{loss_streak}\n\n"
-        "接下來請點選【匯入牌路】，輸入至少15把後即可開始分析。"
+        "完成配置後，可點選【匯入牌路】開始下一步。"
     )
 
 
@@ -1296,6 +1340,7 @@ def menu_text(user):
         "點數配置\n"
         "牌路\n"
         "分析\n"
+        "詳細分析\n"
         "會員說明\n"
         "綁定帳號\n"
         "查詢資格"
@@ -1569,6 +1614,7 @@ def callback():
             "點數配置",
             "本金配置",
             "查詢配置",
+            "詳細分析",
         ]
         if not is_vip(user) and not in_trial(user) and text in locked_commands:
             reply_message(
@@ -1692,7 +1738,6 @@ def callback():
             create_analysis_log(user_id, user["current_road"] or [])
 
             card = prediction_card(user["current_road"] or [], user)
-            card = append_vip_extras(card, user, user_id)
 
             reply_message(
                 reply_token,
@@ -1748,7 +1793,6 @@ def callback():
 
             latest_user = get_user(user_id)
             card = prediction_card(latest_user["current_road"] or [], latest_user)
-            card = append_vip_extras(card, latest_user, user_id)
 
             reply_message(
                 reply_token,
@@ -1766,9 +1810,18 @@ def callback():
             )
             continue
 
+        if text == "詳細分析":
+            card = detail_card(user["current_road"] or [], user)
+            card = append_vip_extras(card, user, user_id)
+            reply_message(
+                reply_token,
+                card,
+                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
+            )
+            continue
+
         if text == "分析":
             card = prediction_card(user["current_road"] or [], user)
-            card = append_vip_extras(card, user, user_id)
             reply_message(
                 reply_token,
                 card,
@@ -1800,7 +1853,7 @@ def callback():
             "你剛剛說："
             f"{text}\n\n"
             "可用功能：開始 / 點數配置 / 會員說明 / 匯入牌路 / 開始分析 / "
-            "牌路 / 分析 / 結束分析 / 綁定帳號 / 查詢資格",
+            "牌路 / 分析 / 詳細分析 / 結束分析 / 綁定帳號 / 查詢資格",
             quick_items=base_quick_reply(is_admin, user["analysis_active"]),
         )
 
