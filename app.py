@@ -11,6 +11,7 @@ import requests
 import psycopg2
 import psycopg2.extras
 
+
 app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
@@ -23,44 +24,49 @@ TIMEOUT_MINUTES = 20
 MAX_ROAD = 100
 MIN_IMPORT_HANDS = 15
 
+
 POINT_CONFIG = {
-    "1000點以下": {
+    "1000以下": {
+        "label": "1000點以下",
         "保守": (50, 50),
         "標準": (50, 100),
         "積極": (100, 150),
     },
-    "1000～3000點": {
+    "1000-3000": {
+        "label": "1000～3000點",
         "保守": (100, 100),
         "標準": (100, 200),
         "積極": (200, 300),
     },
-    "3000～5000點": {
+    "3000-5000": {
+        "label": "3000～5000點",
         "保守": (150, 150),
         "標準": (200, 400),
         "積極": (400, 600),
     },
-    "5000～10000點": {
+    "5000-10000": {
+        "label": "5000～10000點",
         "保守": (250, 250),
         "標準": (300, 600),
         "積極": (600, 1000),
     },
-    "10000～30000點": {
+    "10000-30000": {
+        "label": "10000～30000點",
         "保守": (400, 400),
         "標準": (500, 1000),
         "積極": (1000, 2000),
     },
     "30000以上": {
+        "label": "30000點以上",
         "保守": (500, 500),
         "標準": (1000, 2000),
         "積極": (2000, 4000),
     },
 }
 
-TARGET_OPTIONS = ["30%", "50%", "100%"]
-
 
 # =========================
-# Time / DB
+# Basic helpers
 # =========================
 def now_tw():
     return datetime.now(TZ_TW).replace(tzinfo=None)
@@ -91,12 +97,12 @@ def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS point_range TEXT NULL;",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS point_mode TEXT NULL;",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS profit_target TEXT NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS play_mode TEXT NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS target_profit TEXT NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS round_win INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS round_loss INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS win_streak INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS loss_streak INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS round_hits INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS round_total INTEGER NOT NULL DEFAULT 0;",
         "CREATE INDEX IF NOT EXISTS idx_users_game_account ON users(game_account);",
         """
         CREATE TABLE IF NOT EXISTS analysis_logs (
@@ -113,7 +119,6 @@ def init_db():
         """,
         "CREATE INDEX IF NOT EXISTS idx_analysis_logs_user ON analysis_logs(line_user_id);",
     ]
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             for stmt in statements:
@@ -121,17 +126,10 @@ def init_db():
         conn.commit()
 
 
-# =========================
-# LINE helpers
-# =========================
 def verify_signature(body: bytes, signature: str) -> bool:
     if not LINE_CHANNEL_SECRET:
         return False
-    digest = hmac.new(
-        LINE_CHANNEL_SECRET.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).digest()
+    digest = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
     expected = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
@@ -143,79 +141,92 @@ def line_headers():
     }
 
 
-def make_quick_reply(items):
+def qr(items):
     return [
         {
             "type": "action",
-            "action": {
-                "type": "message",
-                "label": label,
-                "text": text,
-            },
+            "action": {"type": "message", "label": label, "text": text},
         }
         for label, text in items
     ]
 
 
-def base_quick_reply(is_admin=False, analysis_active=False):
-    if analysis_active:
-        items = [
-            ("莊", "莊"),
-            ("閒", "閒"),
-            ("和", "和"),
-            ("分析", "分析"),
-            ("詳細分析", "詳細分析"),
-            ("結束分析", "結束分析"),
-        ]
-    else:
-        items = [
-            ("開始", "開始"),
-            ("點數配置", "點數配置"),
-            ("匯入牌路", "匯入牌路"),
-            ("開始分析", "開始分析"),
-            ("會員說明", "會員說明"),
-            ("綁定帳號", "綁定帳號"),
-        ]
-
+def qr_main(is_admin=False):
+    items = [
+        ("開始", "開始"),
+        ("點數配置", "點數配置"),
+        ("綁定帳號", "綁定帳號"),
+        ("匯入牌路", "匯入牌路"),
+        ("開始分析", "開始分析"),
+        ("使用教學", "會員說明"),
+    ]
     if is_admin:
         items[-1] = ("/待開通", "/待開通")
+    return qr(items)
 
-    return make_quick_reply(items)
 
-
-def point_range_quick_reply():
-    return make_quick_reply([
-        ("1000以下", "點數_1000點以下"),
-        ("1000～3000", "點數_1000～3000點"),
-        ("3000～5000", "點數_3000～5000點"),
-        ("5000～10000", "點數_5000～10000點"),
-        ("10000～30000", "點數_10000～30000點"),
+def qr_point_ranges():
+    return qr([
+        ("1000以下", "點數_1000以下"),
+        ("1000-3000", "點數_1000-3000"),
+        ("3000-5000", "點數_3000-5000"),
+        ("5000-10000", "點數_5000-10000"),
+        ("10000-30000", "點數_10000-30000"),
         ("30000以上", "點數_30000以上"),
+        ("返回", "開始"),
     ])
 
 
-def point_mode_quick_reply():
-    return make_quick_reply([
+def qr_modes():
+    return qr([
         ("保守", "打法_保守"),
         ("標準", "打法_標準"),
         ("積極", "打法_積極"),
+        ("返回", "點數配置"),
     ])
 
 
-def target_quick_reply():
-    return make_quick_reply([
-        ("30%", "獲利_30%"),
-        ("50%", "獲利_50%"),
-        ("100%", "獲利_100%"),
+def qr_targets():
+    return qr([
+        ("30%", "獲利_30"),
+        ("50%", "獲利_50"),
+        ("100%", "獲利_100"),
+        ("返回", "點數配置"),
     ])
 
 
-def after_config_quick_reply():
-    return make_quick_reply([
+def qr_after_config():
+    return qr([
         ("匯入牌路", "匯入牌路"),
         ("開始分析", "開始分析"),
-        ("查詢配置", "查詢配置"),
-        ("會員說明", "會員說明"),
+        ("詳細配置", "查詢配置"),
+        ("主選單", "開始"),
+    ])
+
+
+def qr_imported():
+    return qr([
+        ("開始分析", "開始分析"),
+        ("重新匯入", "匯入牌路"),
+        ("主選單", "開始"),
+    ])
+
+
+def qr_analysis():
+    return qr([
+        ("莊", "莊"),
+        ("閒", "閒"),
+        ("和", "和"),
+        ("詳細分析", "詳細分析"),
+        ("結束分析", "結束分析"),
+    ])
+
+
+def qr_after_end():
+    return qr([
+        ("點數配置", "點數配置"),
+        ("匯入牌路", "匯入牌路"),
+        ("開始", "開始"),
     ])
 
 
@@ -223,7 +234,6 @@ def reply_message(reply_token, text, quick_items=None):
     msg = {"type": "text", "text": text}
     if quick_items:
         msg["quickReply"] = {"items": quick_items}
-
     payload = {"replyToken": reply_token, "messages": [msg]}
     r = requests.post(
         "https://api.line.me/v2/bot/message/reply",
@@ -248,7 +258,7 @@ def push_message(user_id, text):
 
 
 # =========================
-# User / state
+# User state
 # =========================
 def get_user(line_user_id):
     with get_conn() as conn:
@@ -325,12 +335,12 @@ def update_user_fields(line_user_id, **fields):
                     imported_ready = %s,
                     last_active_at = %s,
                     point_range = %s,
-                    point_mode = %s,
-                    profit_target = %s,
+                    play_mode = %s,
+                    target_profit = %s,
+                    round_win = %s,
+                    round_loss = %s,
                     win_streak = %s,
                     loss_streak = %s,
-                    round_hits = %s,
-                    round_total = %s,
                     updated_at = %s
                 WHERE line_user_id = %s
                 RETURNING *
@@ -345,12 +355,12 @@ def update_user_fields(line_user_id, **fields):
                     fields.get("imported_ready", current.get("imported_ready", False)),
                     fields.get("last_active_at", current.get("last_active_at")),
                     fields.get("point_range", current.get("point_range")),
-                    fields.get("point_mode", current.get("point_mode")),
-                    fields.get("profit_target", current.get("profit_target")),
+                    fields.get("play_mode", current.get("play_mode")),
+                    fields.get("target_profit", current.get("target_profit")),
+                    fields.get("round_win", current.get("round_win", 0)),
+                    fields.get("round_loss", current.get("round_loss", 0)),
                     fields.get("win_streak", current.get("win_streak", 0)),
                     fields.get("loss_streak", current.get("loss_streak", 0)),
-                    fields.get("round_hits", current.get("round_hits", 0)),
-                    fields.get("round_total", current.get("round_total", 0)),
                     now_tw(),
                     line_user_id,
                 ),
@@ -379,7 +389,7 @@ def minutes_left(dt):
 
 
 # =========================
-# Admin / binding
+# Admin
 # =========================
 def set_game_account(line_user_id, game_account):
     try:
@@ -437,7 +447,7 @@ def list_pending_accounts():
 
 
 # =========================
-# Road helpers
+# Road / Analysis
 # =========================
 def road_text(road, limit=None):
     data = road[-limit:] if limit else road
@@ -475,11 +485,9 @@ def count_tail_same(seq):
 def segment_lengths(seq):
     if not seq:
         return []
-
     segs = []
     cur = seq[0]
     cnt = 1
-
     for x in seq[1:]:
         if x == cur:
             cnt += 1
@@ -487,7 +495,6 @@ def segment_lengths(seq):
             segs.append((cur, cnt))
             cur = x
             cnt = 1
-
     segs.append((cur, cnt))
     return segs
 
@@ -513,70 +520,6 @@ def transition_rate(seq):
     return round(alternation_count(seq) * 100 / (len(seq) - 1))
 
 
-# =========================
-# V4/V5 derived-road structure
-# =========================
-def derived_color(seq, offset):
-    segs = segment_lengths(seq)
-    if len(segs) <= offset:
-        return "無"
-
-    current_len = segs[-1][1]
-    reference_len = segs[-1 - offset][1]
-
-    if current_len == reference_len:
-        return "紅"
-    if current_len >= 2 and reference_len >= 2:
-        return "紅"
-    return "藍"
-
-
-def subroad_analysis(seq):
-    if len(seq) < 8:
-        return {
-            "big_eye": "無",
-            "small": "無",
-            "cockroach": "無",
-            "score": 50,
-            "label": "下三路資料不足",
-        }
-
-    big_eye = derived_color(seq, 1)
-    small = derived_color(seq, 2)
-    cockroach = derived_color(seq, 3)
-
-    colors = [big_eye, small, cockroach]
-    red = colors.count("紅")
-    blue = colors.count("藍")
-
-    if red == 3:
-        score = 78
-        label = "三路偏紅，結構穩定度高"
-    elif blue == 3:
-        score = 32
-        label = "三路偏藍，結構混亂"
-    elif red == 2:
-        score = 62
-        label = "下三路偏穩，但仍需確認"
-    elif blue == 2:
-        score = 42
-        label = "下三路偏亂，轉折機率提高"
-    else:
-        score = 50
-        label = "下三路中性"
-
-    return {
-        "big_eye": big_eye,
-        "small": small,
-        "cockroach": cockroach,
-        "score": score,
-        "label": label,
-    }
-
-
-# =========================
-# Prediction engine V5
-# =========================
 def sequence_match_model(seq, max_window=6):
     details = []
     bonus_b = 0.0
@@ -592,7 +535,6 @@ def sequence_match_model(seq, max_window=6):
         b_next = 0
         p_next = 0
         matches = 0
-
         for i in range(0, len(seq) - window):
             past = seq[i:i + window]
             if past == pattern and i + window < len(seq):
@@ -603,7 +545,6 @@ def sequence_match_model(seq, max_window=6):
                 elif nxt == "閒":
                     p_next += 1
                     matches += 1
-
         if matches > 0:
             weight = {6: 20, 5: 16, 4: 12, 3: 8}.get(window, 6)
             bonus_b += weight * (b_next / matches)
@@ -738,22 +679,60 @@ def recency_weight_model(seq):
     bonus_b = 0.0
     bonus_p = 0.0
     last = seq[-8:] if len(seq) >= 8 else seq
-
     for x, w in zip(last, range(1, len(last) + 1)):
         if x == "莊":
             bonus_b += w * 0.7
         elif x == "閒":
             bonus_p += w * 0.7
-
     return bonus_b, bonus_p
 
 
-def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label, sub_score):
+def analyze_subroads(seq):
+    segs = segment_lengths(seq)
+    if len(segs) < 4:
+        return {
+            "big_eye": "不足",
+            "small": "不足",
+            "cockroach": "不足",
+            "stability_score": 50,
+            "note": "下三路資料不足",
+        }
+
+    lengths = [c for _, c in segs]
+    recent = lengths[-6:]
+    diffs = [abs(recent[i] - recent[i - 1]) for i in range(1, len(recent))]
+    avg_diff = sum(diffs) / len(diffs) if diffs else 0
+    same_count = sum(1 for d in diffs if d == 0)
+
+    big_eye = "紅" if same_count >= 2 else "藍"
+    small = "紅" if avg_diff <= 1 else "藍"
+    cockroach = "紅" if max(diffs or [0]) <= 2 else "藍"
+
+    red_count = [big_eye, small, cockroach].count("紅")
+    stability_score = 30 + red_count * 20
+    if red_count == 3:
+        note = "三路偏紅，結構較穩"
+    elif red_count == 0:
+        note = "三路偏藍，結構混亂"
+    else:
+        note = "三路交錯，轉折觀察"
+
+    return {
+        "big_eye": big_eye,
+        "small": small,
+        "cockroach": cockroach,
+        "stability_score": stability_score,
+        "note": note,
+    }
+
+
+def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label, subroad):
     gap = abs(banker_pct - player_pct)
     t_rate = transition_rate(seq)
     avg_len = avg_segment_length(seq)
+    stability = subroad.get("stability_score", 50)
 
-    if gap >= 22 and total_matches >= 2 and sub_score >= 60:
+    if gap >= 22 and total_matches >= 2 and stability >= 70:
         signal = "強"
     elif gap >= 14 or total_matches >= 1:
         signal = "中強"
@@ -764,13 +743,13 @@ def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label,
 
     if len(seq) < 15:
         risk = "中高"
-    elif sub_score <= 40:
+    elif stability < 45:
         risk = "高"
     elif "混合" in structure_label and gap < 10:
         risk = "高"
     elif t_rate > 75 or avg_len < 1.35:
         risk = "中高"
-    elif gap >= 18 and signal in ["強", "中強"] and sub_score >= 60:
+    elif gap >= 18 and signal in ["強", "中強"] and stability >= 70:
         risk = "中低"
     else:
         risk = "中"
@@ -778,13 +757,15 @@ def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label,
     return signal, risk
 
 
-def prediction_v5(road):
+def prediction_v6(road):
     seq = filter_main_road(road)[-30:]
 
     if not seq:
         return {
             "banker_pct": 50,
             "player_pct": 50,
+            "direction": "莊",
+            "direction_pct": 50,
             "pattern": "資料不足",
             "risk": "高",
             "signal": "弱",
@@ -792,14 +773,8 @@ def prediction_v5(road):
             "match_note": "尚無匹配資料",
             "structure_note": "尚無結構資料",
             "match_details": [],
-            "subroad": subroad_analysis([]),
-            "metrics": {
-                "莊": 0,
-                "閒": 0,
-                "交錯率": 0,
-                "平均段長": 0,
-                "最長連續": 0,
-            },
+            "subroad": {"big_eye": "不足", "small": "不足", "cockroach": "不足", "stability_score": 50, "note": "下三路資料不足"},
+            "metrics": {"莊": 0, "閒": 0, "交錯率": 0, "平均段長": 0, "最長連續": 0},
         }
 
     banker = seq.count("莊")
@@ -816,17 +791,15 @@ def prediction_v5(road):
     score_b += rb + tb + sb + mb
     score_p += rp + tp + sp + mp
 
-    sub = subroad_analysis(seq)
-    if sub["score"] >= 70:
-        # structure stable: amplify leader
+    subroad = analyze_subroads(seq)
+    if subroad["stability_score"] >= 70:
         if score_b >= score_p:
             score_b += 8
         else:
             score_p += 8
-    elif sub["score"] <= 40:
-        # structure messy: reduce overconfidence
-        score_b += 2
-        score_p += 2
+    elif subroad["stability_score"] <= 40:
+        score_b *= 0.95
+        score_p *= 0.95
 
     if transition_rate(seq) >= 65:
         next_side = "閒" if seq[-1] == "莊" else "莊"
@@ -846,11 +819,20 @@ def prediction_v5(road):
     banker_pct = round(score_b * 100 / total)
     player_pct = 100 - banker_pct
 
-    signal, risk = risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_note, sub["score"])
+    signal, risk = risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_note, subroad)
+
+    if banker_pct >= player_pct:
+        direction = "莊"
+        direction_pct = banker_pct
+    else:
+        direction = "閒"
+        direction_pct = player_pct
 
     return {
         "banker_pct": banker_pct,
         "player_pct": player_pct,
+        "direction": direction,
+        "direction_pct": direction_pct,
         "pattern": structure_note,
         "risk": risk,
         "signal": signal,
@@ -858,7 +840,7 @@ def prediction_v5(road):
         "match_note": match_note,
         "structure_note": structure_note,
         "match_details": match_details,
-        "subroad": sub,
+        "subroad": subroad,
         "metrics": {
             "莊": banker,
             "閒": player,
@@ -869,65 +851,130 @@ def prediction_v5(road):
     }
 
 
-def ai_decision_info(data, user):
-    gap = abs(data["banker_pct"] - data["player_pct"])
-    signal = data["signal"]
-    risk = data["risk"]
-    sub_score = data["subroad"]["score"]
+# =========================
+# Points / decision
+# =========================
+def point_range_text(user):
+    key = user.get("point_range")
+    if not key or key not in POINT_CONFIG:
+        return "尚未設定"
+    return POINT_CONFIG[key]["label"]
 
-    if gap >= 18 and signal in ["中強", "強"] and risk != "高" and sub_score >= 55:
-        status = "✅ 可觀察進場"
-        note = "結構與方向偏一致，可列入觀察。"
-    elif gap >= 8 and risk != "高":
-        status = "⚠️ 等待確認"
-        note = "目前有方向，但仍需要下一口確認。"
+
+def get_point_unit(user):
+    key = user.get("point_range")
+    mode = user.get("play_mode") or "保守"
+    if key not in POINT_CONFIG:
+        return None
+    return POINT_CONFIG[key].get(mode, POINT_CONFIG[key]["保守"])
+
+
+def point_config_card(user):
+    key = user.get("point_range")
+    mode = user.get("play_mode")
+    target = user.get("target_profit")
+
+    if not key:
+        return (
+            "💰 點數配置\n\n"
+            "請先選擇點數區間。\n\n"
+            "流程：\n"
+            "1. 選擇點數區間\n"
+            "2. 選擇打法模式\n"
+            "3. 選擇期望獲利\n\n"
+            "完成後即可匯入牌路。"
+        )
+
+    if not mode:
+        return (
+            "💰 點數配置\n\n"
+            f"點數區間：{POINT_CONFIG[key]['label']}\n\n"
+            "請選擇打法模式。"
+        )
+
+    unit = get_point_unit(user)
+    if not unit:
+        unit_text = "尚未設定"
+    elif unit[0] == unit[1]:
+        unit_text = f"{unit[0]}點"
     else:
-        status = "⛔ 暫停本輪"
-        note = "風險偏高或結構不穩，先觀察。"
+        unit_text = f"{unit[0]}～{unit[1]}點"
 
-    return {
-        "status": status,
-        "note": note,
-        "point_line": point_action_line(user, status),
-    }
+    target_text = target if target else "尚未設定"
 
-
-def ai_decision_text(data, user):
-    info = ai_decision_info(data, user)
     return (
-        "🧠 AI 決策提示\n\n"
-        f"狀態：{info['status']}\n"
-        f"說明：{info['note']}\n\n"
-        f"{info['point_line']}\n\n"
-        "提醒：此為牌路結構與點數控管提示，請自行控管節奏。"
+        "💰 點數配置完成\n\n"
+        f"點數區間：{POINT_CONFIG[key]['label']}\n"
+        f"打法模式：{mode}\n"
+        f"期望獲利：{target_text}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"參考點數：{unit_text}\n\n"
+        "節奏控管：\n"
+        "👉 連續失利2次：切回低區間\n"
+        "👉 連續失利5次：暫停本輪\n"
+        "👉 連續順利2次：提高至中高區間\n"
+        "👉 連續順利5次：鎖利回中段\n\n"
+        "下一步：請點選【匯入牌路】。"
     )
 
 
-def decision_card(road, user=None):
-    data = prediction_v5(road)
-    user = user or {}
-    info = ai_decision_info(data, user)
-    leader = "莊" if data["banker_pct"] >= data["player_pct"] else "閒"
-    pct = data["banker_pct"] if leader == "莊" else data["player_pct"]
-    sub = data["subroad"]
+def decision_status(data):
+    gap = abs(data["banker_pct"] - data["player_pct"])
+    risk = data["risk"]
+    signal = data["signal"]
+    stability = data["subroad"]["stability_score"]
+
+    if risk == "高" or stability < 45 or gap < 8:
+        return "⛔ 暫停觀察", "風險偏高或結構不穩，先觀察。"
+    if gap >= 18 and signal in ["中強", "強"] and risk in ["中", "中低"]:
+        return "✅ 可啟動觀察", "方向差距明顯，結構可列入觀察。"
+    return "⚠️ 等待確認", "方向有傾向，但仍需要下一把確認。"
+
+
+def point_decision_text(user, data):
+    unit = get_point_unit(user)
+    status, _reason = decision_status(data)
+
+    if not unit:
+        return "點數配置：尚未設定，請先點選【點數配置】。"
+
+    low, high = unit
+    if low == high:
+        unit_text = f"{low}點"
+    else:
+        unit_text = f"{low}～{high}點"
+
+    if "暫停" in status:
+        return "本輪：暫停啟動點數。"
+    if "等待" in status:
+        return f"本輪：等待確認，參考低區間 {low}點。"
+    return f"本輪：可列入觀察，參考區間 {unit_text}。"
+
+
+def decision_card(user, road):
+    data = prediction_v6(road)
+    status, reason = decision_status(data)
+
+    direction_line = f"👉👉👉 {data['direction']} {data['direction_pct']}% 👈👈👈"
+    point_text = point_decision_text(user, data)
 
     return (
-        "🎯 本局方向\n\n"
-        f"👉👉👉 {leader} {pct}% 👈👈👈\n\n"
+        "🎯 方向決策輔助\n\n"
+        f"{direction_line}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "🧠 AI 決策\n\n"
-        f"{info['status']}\n"
-        f"原因：{info['note']}\n\n"
+        "🧠 AI 判斷\n\n"
+        f"{status}\n"
+        f"原因：{reason}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "⚡ 快速判斷\n\n"
         f"信號：{data['signal']}\n"
         f"風險：{data['risk']}\n"
         f"型態：{data['structure_note']}\n"
         f"尾段：{data['tail_note']}\n"
-        f"下三路：{sub['big_eye']} / {sub['small']} / {sub['cockroach']}（穩定度{sub['score']}）\n\n"
+        f"下三路：{data['subroad']['big_eye']} / {data['subroad']['small']} / {data['subroad']['cockroach']}（穩定度{data['subroad']['stability_score']}）\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "💰 點數策略\n\n"
-        f"{info['point_line']}\n\n"
+        "💰 點數配置\n\n"
+        f"{point_text}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "📌 操作\n\n"
         "👉 繼續輸入：莊 / 閒 / 和\n"
@@ -936,44 +983,39 @@ def decision_card(road, user=None):
     )
 
 
-def prediction_card(road, user=None):
-    return decision_card(road, user)
-
-
-def detail_card(road, user=None):
+def detail_card(user, road):
+    data = prediction_v6(road)
     seq = filter_main_road(road)[-30:]
-    data = prediction_v5(road)
-
-    if data["match_details"]:
-        detail_lines = "\n".join([f"・{x}" for x in data["match_details"]])
+    details = "\n".join([f"・{x}" for x in data["match_details"]]) if data["match_details"] else "・目前無足夠重複樣本"
+    unit = get_point_unit(user)
+    if unit:
+        point_unit = f"{unit[0]}點" if unit[0] == unit[1] else f"{unit[0]}～{unit[1]}點"
     else:
-        detail_lines = "・目前無足夠重複樣本"
+        point_unit = "尚未設定"
 
-    sub = data["subroad"]
-
-    card = (
-        "📊 詳細分析 V5\n\n"
+    return (
+        "📊 詳細分析 V6\n\n"
         f"目前牌路：\n{road_text(seq[-20:])}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "預測機率：\n"
-        f"👉 莊：{data['banker_pct']}%\n"
-        f"👉 閒：{data['player_pct']}%\n\n"
-        f"信號強度：{data['signal']}\n\n"
+        f"莊：{data['banker_pct']}%\n"
+        f"閒：{data['player_pct']}%\n"
+        f"信號強度：{data['signal']}\n"
+        f"風險：{data['risk']}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "判斷依據：\n\n"
         "▍序列匹配\n"
         f"{data['match_note']}\n"
-        f"{detail_lines}\n\n"
+        f"{details}\n\n"
         "▍尾段動能\n"
         f"{data['tail_note']}\n\n"
         "▍結構判斷\n"
         f"{data['structure_note']}\n\n"
         "▍下三路結構\n"
-        f"大眼仔：{sub['big_eye']}\n"
-        f"小路：{sub['small']}\n"
-        f"曱甴路：{sub['cockroach']}\n"
-        f"穩定度：{sub['score']}\n"
-        f"{sub['label']}\n\n"
+        f"大眼仔：{data['subroad']['big_eye']}\n"
+        f"小路：{data['subroad']['small']}\n"
+        f"曱甴路：{data['subroad']['cockroach']}\n"
+        f"穩定度：{data['subroad']['stability_score']}\n"
+        f"{data['subroad']['note']}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "數據指標：\n"
         f"莊：{data['metrics']['莊']}\n"
@@ -981,138 +1023,23 @@ def detail_card(road, user=None):
         f"交錯率：{data['metrics']['交錯率']}%\n"
         f"平均段長：{data['metrics']['平均段長']}\n"
         f"最長連續：{data['metrics']['最長連續']}\n\n"
-        "風險：\n"
-        f"{data['risk']}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        f"{ai_decision_text(data, user or {})}"
-    )
-
-    return card
-
-
-# =========================
-# Point config
-# =========================
-def point_range_from_text(text):
-    return text.replace("點數_", "", 1)
-
-
-def point_mode_from_text(text):
-    return text.replace("打法_", "", 1)
-
-
-def profit_target_from_text(text):
-    return text.replace("獲利_", "", 1)
-
-
-def get_point_range(user):
-    return user.get("point_range") or "尚未設定"
-
-
-def get_point_mode(user):
-    return user.get("point_mode") or "尚未設定"
-
-
-def get_profit_target(user):
-    return user.get("profit_target") or "尚未設定"
-
-
-def get_point_bet_range(user):
-    point_range = user.get("point_range")
-    mode = user.get("point_mode")
-
-    if point_range not in POINT_CONFIG or mode not in ["保守", "標準", "積極"]:
-        return None
-
-    return POINT_CONFIG[point_range][mode]
-
-
-def format_point_range(pair):
-    if not pair:
-        return "尚未設定"
-    low, high = pair
-    if low == high:
-        return f"{low}點"
-    return f"{low}～{high}點"
-
-
-def point_action_line(user, decision_status):
-    pair = get_point_bet_range(user)
-    if not pair:
-        return "點數配置：尚未完成，建議先完成點數配置。"
-
-    low, high = pair
-    win_streak = user.get("win_streak", 0) or 0
-    loss_streak = user.get("loss_streak", 0) or 0
-
-    if "暫停" in decision_status:
-        return "點數建議：本輪暫停，不建議啟動點數。"
-
-    if loss_streak >= 5:
-        return "點數建議：連續失利已達5次，建議暫停本輪。"
-    if loss_streak >= 3:
-        return f"點數建議：連續失利，降至最低區間 {low}點。"
-    if loss_streak >= 2:
-        return f"點數建議：連失2次，建議壓低至 {low}點附近。"
-
-    if win_streak >= 5:
-        mid = (low + high) // 2
-        return f"點數建議：連續順利，建議鎖利並回到中段 {mid}點附近。"
-    if win_streak >= 3:
-        return f"點數建議：連續順利，可使用上限區間 {high}點附近。"
-    if win_streak >= 2:
-        mid = (low + high) // 2
-        return f"點數建議：連順2次，可提升至 {mid}～{high}點。"
-
-    return f"點數建議：正常區間 {format_point_range(pair)}。"
-
-
-def point_config_card(user):
-    pair = get_point_bet_range(user)
-    win_streak = user.get("win_streak", 0) or 0
-    loss_streak = user.get("loss_streak", 0) or 0
-    total = user.get("round_total", 0) or 0
-    hits = user.get("round_hits", 0) or 0
-    rate = round(hits * 100 / total) if total else 0
-
-    return (
-        "💰 點數配置\n\n"
-        f"點數區間：{get_point_range(user)}\n"
-        f"打法模式：{get_point_mode(user)}\n"
-        f"期望獲利：{get_profit_target(user)}\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"建議點數：{format_point_range(pair)}\n\n"
-        "升降邏輯：\n"
-        "👉 連失2次：降至低區間\n"
-        "👉 連失5次：建議暫停本輪\n"
-        "👉 連順2次：提高至中高區間\n"
-        "👉 連順5次：建議鎖利回中段\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"本輪紀錄：{hits}/{total}（{rate}%）\n"
-        f"連續順利：{win_streak}\n"
-        f"連續失利：{loss_streak}\n\n"
-        "完成配置後，可點選【匯入牌路】開始下一步。"
-    )
-
-
-def point_setup_intro():
-    return (
-        "💰 點數配置\n\n"
-        "請先選擇目前點數區間。\n\n"
-        "系統會依照：\n"
-        "① 點數區間\n"
-        "② 打法模式\n"
-        "③ 期望獲利\n\n"
-        "自動給出建議點數與升降邏輯。"
+        "💰 點數配置\n"
+        f"點數區間：{point_range_text(user)}\n"
+        f"打法模式：{user.get('play_mode') or '尚未設定'}\n"
+        f"期望獲利：{user.get('target_profit') or '尚未設定'}\n"
+        f"參考點數：{point_unit}\n"
+        f"本輪紀錄：{user.get('round_win', 0)}/{user.get('round_win', 0) + user.get('round_loss', 0)}\n"
+        f"連續順利：{user.get('win_streak', 0)}\n"
+        f"連續失利：{user.get('loss_streak', 0)}"
     )
 
 
 # =========================
-# Analysis logs
+# Analysis logs / scoring
 # =========================
 def create_analysis_log(line_user_id, road):
-    data = prediction_v5(road)
-
+    data = prediction_v6(road)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1140,11 +1067,9 @@ def create_analysis_log(line_user_id, road):
         conn.commit()
 
 
-def backfill_previous_actual_and_update_streak(user, actual_result):
+def backfill_previous_actual(line_user_id, actual_result):
     if actual_result not in ["莊", "閒"]:
-        return user
-
-    line_user_id = user["line_user_id"]
+        return None
 
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1162,38 +1087,38 @@ def backfill_previous_actual_and_update_streak(user, actual_result):
             row = cur.fetchone()
 
             if not row:
-                return user
+                conn.commit()
+                return None
 
             predicted = "莊" if row["banker_pct"] >= row["player_pct"] else "閒"
-            hit = predicted == actual_result
+            is_hit = predicted == actual_result
 
             cur.execute(
                 "UPDATE analysis_logs SET actual_next_result = %s WHERE id = %s",
                 (actual_result, row["id"]),
             )
+
         conn.commit()
+        return is_hit
 
-    current_hits = user.get("round_hits", 0) or 0
-    current_total = user.get("round_total", 0) or 0
-    win_streak = user.get("win_streak", 0) or 0
-    loss_streak = user.get("loss_streak", 0) or 0
 
-    if hit:
-        current_hits += 1
-        win_streak += 1
-        loss_streak = 0
-    else:
-        loss_streak += 1
-        win_streak = 0
+def update_round_record(user_id, is_hit):
+    user = get_user(user_id)
+    if is_hit is None:
+        return user
 
-    current_total += 1
-
+    if is_hit:
+        return update_user_fields(
+            user_id,
+            round_win=(user.get("round_win") or 0) + 1,
+            win_streak=(user.get("win_streak") or 0) + 1,
+            loss_streak=0,
+        )
     return update_user_fields(
-        line_user_id,
-        round_hits=current_hits,
-        round_total=current_total,
-        win_streak=win_streak,
-        loss_streak=loss_streak,
+        user_id,
+        round_loss=(user.get("round_loss") or 0) + 1,
+        loss_streak=(user.get("loss_streak") or 0) + 1,
+        win_streak=0,
     )
 
 
@@ -1232,96 +1157,55 @@ def hit_rate_summary(line_user_id):
 def get_status_text(user):
     if is_vip(user):
         days = minutes_left(user["vip_expire_at"]) // 1440
-        return (
-            "目前狀態：VIP\n\n"
-            f"到期時間：{user['vip_expire_at']}\n"
-            f"剩餘：約 {days} 天"
-        )
+        return f"目前狀態：VIP\n\n到期時間：{user['vip_expire_at']}\n剩餘：約 {days} 天"
 
     if in_trial(user):
         mins = minutes_left(user["trial_end_at"])
-        return (
-            "目前狀態：免費試用中\n\n"
-            f"剩餘時間：約 {mins} 分鐘\n"
-            "試用結束後，完整分析需開通VIP。"
-        )
+        return f"目前狀態：免費試用中\n\n剩餘時間：約 {mins} 分鐘\n試用結束後，完整分析需開通VIP。"
 
-    return (
-        "試用已結束\n\n"
-        "VIP開通：\n"
-        "👉 註冊3A帳號 / 已有3A帳號\n"
-        "👉 聯絡管理員"
-    )
+    return "試用已結束\n\nVIP開通：\n👉 註冊3A帳號 / 已有3A帳號\n👉 聯絡管理員"
 
 
 def member_guide_text():
     return (
         "【使用教學】\n\n"
-        "本系統為「牌路紀錄＋即時分析＋點數配置」模式。\n"
-        "請依照以下流程操作：\n\n"
+        "本系統為「牌路紀錄＋方向決策輔助＋點數配置」模式。\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "① 開始使用\n"
-        "點選【開始】，查看目前可用功能。\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
+        "① 點數配置\n"
+        "點選【點數配置】\n"
+        "依序選擇：點數區間 → 打法模式 → 期望獲利。\n\n"
         "② 綁定帳號\n"
         "點選【綁定帳號】\n"
-        "輸入你的遊戲帳號（例：ck76888）\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "③ 點數配置\n"
-        "點選【點數配置】\n"
-        "依序選擇：\n"
-        "・點數區間\n"
-        "・打法模式：保守 / 標準 / 積極\n"
-        "・期望獲利：30% / 50% / 100%\n\n"
-        "系統會產生建議點數與升降邏輯。\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "④ 匯入牌路\n"
+        "輸入你的遊戲帳號，例如：ck76888。\n\n"
+        "③ 匯入牌路\n"
         "點選【匯入牌路】\n"
-        "一次輸入目前牌路，至少15把以上。\n\n"
+        "輸入目前牌路，至少15把以上。\n\n"
         "例：\n"
-        "莊莊莊閒莊閒閒莊莊閒莊閒閒莊莊\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "⑤ 開始分析\n"
+        "莊莊莊閒莊閒閒莊莊閒閒莊閒莊閒\n\n"
+        "④ 開始分析\n"
         "點選【開始分析】\n"
-        "系統會輸出：\n"
-        "・莊 / 閒預測機率\n"
-        "・信號強度\n"
-        "・序列匹配\n"
-        "・尾段動能\n"
-        "・結構判斷\n"
-        "・下三路結構\n"
-        "・AI決策提示\n"
-        "・點數建議\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "⑥ 即時紀錄\n"
-        "每開一把，直接點選：\n\n"
-        "👉 莊\n"
-        "👉 閒\n"
-        "👉 和\n\n"
-        "系統會同步更新分析與連順 / 連失狀態。\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
+        "系統會回覆方向決策輔助與點數配置提示。\n\n"
+        "⑤ 即時紀錄\n"
+        "每開一把，點選或輸入：\n"
+        "莊 / 閒 / 和\n\n"
+        "系統會即時更新：\n"
+        "方向、AI判斷、風險、點數配置。\n\n"
+        "⑥ 詳細分析\n"
+        "如需查看序列匹配、下三路、交錯率、回測資料，點選【詳細分析】。\n\n"
         "⑦ 結束分析\n"
-        "本輪結束請點選【結束分析】。\n"
-        "系統會清空本輪牌路，下一輪需重新匯入牌路。\n\n"
+        "本輪結束時，點選【結束分析】。\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "⚠️ 未開通VIP將無法使用完整分析功能。\n"
-        "請先綁定帳號並聯絡管理員開通。\n\n"
-        "━━━━━━━━━━━━━━━\n"
         "【開通教學】\n\n"
-        "Step1\n"
+        "Step 1\n"
         "請由以下入口完成註冊：\n"
         "sn043.aaawin88.com\n\n"
-        "👉 已有帳號者請跳至 Step 5\n\n"
+        "👉 已有帳號者請直接綁定帳號。\n\n"
         "Step 2\n"
-        "請先點選下方【綁定帳號】\n\n"
+        "點選【綁定帳號】。\n\n"
         "Step 3\n"
-        "輸入你的遊戲帳號\n"
-        "例如：ck76888\n\n"
+        "輸入你的遊戲帳號。\n\n"
         "Step 4\n"
-        "送出後，系統會將你的資料列入待開通名單\n\n"
-        "Step 5\n"
-        "聯絡管理員確認開通狀態\n\n"
-        "開通完成後，即可使用完整分析功能。\n\n"
+        "聯絡管理員確認開通狀態。\n\n"
         "※ 實際資格、發放方式及相關規範，請以平台公告為準。"
     )
 
@@ -1329,30 +1213,16 @@ def member_guide_text():
 def menu_text(user):
     tag = "VIP會員" if is_vip(user) else ("免費試用中" if in_trial(user) else "免費版")
     return (
-        f"歡迎使用百家即時分析助手（{tag}）\n\n"
+        f"歡迎使用 AI 百家方向決策輔助系統（{tag}）\n\n"
         "建議流程：\n"
         "1. 點數配置\n"
-        "2. 匯入牌路\n"
-        "3. 開始分析\n"
-        "4. 分析中逐口按 莊 / 閒 / 和\n"
-        "5. 結束分析\n\n"
-        "常用功能：\n"
-        "點數配置\n"
-        "牌路\n"
-        "分析\n"
-        "詳細分析\n"
-        "會員說明\n"
-        "綁定帳號\n"
-        "查詢資格"
+        "2. 綁定帳號\n"
+        "3. 匯入牌路\n"
+        "4. 開始分析\n"
+        "5. 莊 / 閒 / 和 即時紀錄\n"
+        "6. 結束分析\n\n"
+        "請從下方按鈕開始。"
     )
-
-
-def append_vip_extras(card, user, user_id):
-    if is_vip(user):
-        card += "\n\n" + hit_rate_summary(user_id)
-        if user.get("point_range") and user.get("point_mode"):
-            card += "\n\n" + point_config_card(user)
-    return card
 
 
 # =========================
@@ -1391,11 +1261,7 @@ def callback():
             reply_token = event.get("replyToken")
             if user_id and reply_token:
                 user = ensure_user(user_id)
-                reply_message(
-                    reply_token,
-                    menu_text(user),
-                    quick_items=base_quick_reply(user_id in ADMIN_USER_IDS, user["analysis_active"]),
-                )
+                reply_message(reply_token, menu_text(user), quick_items=qr_main(user_id in ADMIN_USER_IDS))
             continue
 
         if event.get("type") != "message":
@@ -1416,44 +1282,36 @@ def callback():
         user = get_user(user_id)
         is_admin = user_id in ADMIN_USER_IDS
 
-        # =========================
         # Admin commands
-        # =========================
         if is_admin and text == "/待開通":
             pending = list_pending_accounts()
             if not pending:
-                reply_message(reply_token, "目前沒有待開通名單。", quick_items=base_quick_reply(True, user["analysis_active"]))
+                reply_message(reply_token, "目前沒有待開通名單。", quick_items=qr_main(True))
             else:
                 rows = [f"{i}. {row['game_account']}" for i, row in enumerate(pending[:20], 1)]
-                reply_message(
-                    reply_token,
-                    "待開通名單：\n" + "\n".join(rows),
-                    quick_items=base_quick_reply(True, user["analysis_active"]),
-                )
+                reply_message(reply_token, "待開通名單：\n" + "\n".join(rows), quick_items=qr_main(True))
             continue
 
         if is_admin and text.startswith("/vip "):
             parts = text.split()
             if len(parts) != 3:
-                reply_message(reply_token, "格式錯誤，請用：/vip 遊戲帳號 天數", quick_items=base_quick_reply(True, user["analysis_active"]))
+                reply_message(reply_token, "格式錯誤，請用：/vip 遊戲帳號 天數", quick_items=qr_main(True))
                 continue
-
             try:
                 days = int(parts[2])
             except ValueError:
-                reply_message(reply_token, "天數請輸入數字，例如：/vip ck76888 30", quick_items=base_quick_reply(True, user["analysis_active"]))
+                reply_message(reply_token, "天數請輸入數字，例如：/vip ck76888 30", quick_items=qr_main(True))
                 continue
 
             game_account = parts[1]
             updated_user, err = grant_vip_by_game_account(game_account, days)
-
             if err:
-                reply_message(reply_token, err, quick_items=base_quick_reply(True, user["analysis_active"]))
+                reply_message(reply_token, err, quick_items=qr_main(True))
             else:
                 reply_message(
                     reply_token,
                     f"已開通VIP\n\n帳號：{game_account}\n天數：{days}天\n到期：{updated_user['vip_expire_at']}",
-                    quick_items=base_quick_reply(True, user["analysis_active"]),
+                    quick_items=qr_main(True),
                 )
                 push_message(
                     updated_user["line_user_id"],
@@ -1464,114 +1322,43 @@ def callback():
         if is_admin and text.startswith("/unvip "):
             parts = text.split()
             if len(parts) != 2:
-                reply_message(reply_token, "格式錯誤，請用：/unvip 遊戲帳號", quick_items=base_quick_reply(True, user["analysis_active"]))
+                reply_message(reply_token, "格式錯誤，請用：/unvip 遊戲帳號", quick_items=qr_main(True))
                 continue
-
             ok = revoke_vip_by_game_account(parts[1])
-            reply_message(
-                reply_token,
-                f"已取消VIP：{parts[1]}" if ok else "找不到這個遊戲帳號。",
-                quick_items=base_quick_reply(True, user["analysis_active"]),
-            )
+            reply_message(reply_token, f"已取消VIP：{parts[1]}" if ok else "找不到這個遊戲帳號。", quick_items=qr_main(True))
             continue
 
-        # =========================
         # Pending flows
-        # =========================
         if user.get("pending_flow") == "bind_game_account":
             ok = set_game_account(user_id, text)
             if ok:
                 reply_message(
                     reply_token,
                     f"已收到你的遊戲帳號：{text}\n\n請等待管理員確認開通VIP。",
-                    quick_items=base_quick_reply(is_admin, user["analysis_active"]),
+                    quick_items=qr_main(is_admin),
                 )
             else:
                 reply_message(
                     reply_token,
                     "這個遊戲帳號可能已被綁定，請換一個或聯絡管理員。",
-                    quick_items=base_quick_reply(is_admin, user["analysis_active"]),
+                    quick_items=qr_main(is_admin),
                 )
-            continue
-
-        if user.get("pending_flow") == "point_range":
-            if not text.startswith("點數_"):
-                reply_message(reply_token, "請使用下方按鈕選擇點數區間。", quick_items=point_range_quick_reply())
-                continue
-
-            selected_range = point_range_from_text(text)
-            if selected_range not in POINT_CONFIG:
-                reply_message(reply_token, "點數區間錯誤，請重新選擇。", quick_items=point_range_quick_reply())
-                continue
-
-            user = update_user_fields(user_id, point_range=selected_range, pending_flow="point_mode")
-            reply_message(
-                reply_token,
-                f"已選擇點數區間：{selected_range}\n\n接著請選擇打法模式。",
-                quick_items=point_mode_quick_reply(),
-            )
-            continue
-
-        if user.get("pending_flow") == "point_mode":
-            if not text.startswith("打法_"):
-                reply_message(reply_token, "請使用下方按鈕選擇打法模式。", quick_items=point_mode_quick_reply())
-                continue
-
-            selected_mode = point_mode_from_text(text)
-            if selected_mode not in ["保守", "標準", "積極"]:
-                reply_message(reply_token, "打法模式錯誤，請重新選擇。", quick_items=point_mode_quick_reply())
-                continue
-
-            user = update_user_fields(user_id, point_mode=selected_mode, pending_flow="profit_target")
-            reply_message(
-                reply_token,
-                f"已選擇打法模式：{selected_mode}\n\n接著請選擇期望獲利。",
-                quick_items=target_quick_reply(),
-            )
-            continue
-
-        if user.get("pending_flow") == "profit_target":
-            if not text.startswith("獲利_"):
-                reply_message(reply_token, "請使用下方按鈕選擇期望獲利。", quick_items=target_quick_reply())
-                continue
-
-            selected_target = profit_target_from_text(text)
-            if selected_target not in TARGET_OPTIONS:
-                reply_message(reply_token, "期望獲利選項錯誤，請重新選擇。", quick_items=target_quick_reply())
-                continue
-
-            user = update_user_fields(
-                user_id,
-                profit_target=selected_target,
-                pending_flow=None,
-                win_streak=0,
-                loss_streak=0,
-                round_hits=0,
-                round_total=0,
-            )
-            reply_message(
-                reply_token,
-                "點數配置完成\n\n" + point_config_card(user),
-                quick_items=after_config_quick_reply(),
-            )
             continue
 
         if user.get("pending_flow") == "import_road":
             parsed = normalize_input_road(text)
-
             if not parsed:
                 reply_message(
                     reply_token,
                     "格式錯誤，請只輸入：莊 / 閒 / 和\n例如：莊莊莊閒莊閒",
-                    quick_items=base_quick_reply(is_admin, False),
+                    quick_items=qr_main(is_admin),
                 )
                 continue
-
             if len(parsed) < MIN_IMPORT_HANDS:
                 reply_message(
                     reply_token,
                     f"目前只有 {len(parsed)} 把，至少要 {MIN_IMPORT_HANDS} 把才能開始分析。",
-                    quick_items=base_quick_reply(is_admin, False),
+                    quick_items=qr_main(is_admin),
                 )
                 continue
 
@@ -1581,10 +1368,10 @@ def callback():
                 pending_flow=None,
                 imported_ready=True,
                 analysis_active=False,
+                round_win=0,
+                round_loss=0,
                 win_streak=0,
                 loss_streak=0,
-                round_hits=0,
-                round_total=0,
             )
             imported_user = get_user(user_id)
             reply_message(
@@ -1592,120 +1379,85 @@ def callback():
                 "牌路匯入完成\n\n"
                 f"目前牌路：\n{road_text(imported_user['current_road'])}\n\n"
                 "接下來請點選【開始分析】。",
-                quick_items=make_quick_reply([
-                    ("開始分析", "開始分析"),
-                    ("重新匯入", "匯入牌路"),
-                    ("點數配置", "點數配置"),
-                ]),
+                quick_items=qr_imported(),
             )
             continue
 
-        # =========================
         # Lock trial / VIP
-        # =========================
-        locked_commands = [
-            "分析",
-            "牌路",
-            "匯入牌路",
-            "開始分析",
-            "莊",
-            "閒",
-            "和",
-            "點數配置",
-            "本金配置",
-            "查詢配置",
-            "詳細分析",
-        ]
+        locked_commands = ["分析", "詳細分析", "牌路", "匯入牌路", "開始分析", "莊", "閒", "和", "點數配置", "查詢配置"]
         if not is_vip(user) and not in_trial(user) and text in locked_commands:
-            reply_message(
-                reply_token,
-                get_status_text(user),
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
-            )
+            reply_message(reply_token, get_status_text(user), quick_items=qr_main(is_admin))
             continue
 
-        # =========================
-        # General commands
-        # =========================
+        # General
         if text == "開始":
-            reply_message(
-                reply_token,
-                menu_text(user),
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
-            )
+            reply_message(reply_token, menu_text(user), quick_items=qr_main(is_admin))
             continue
 
         if text in ["會員說明", "使用教學", "開通教學"]:
-            reply_message(
-                reply_token,
-                member_guide_text(),
-                quick_items=make_quick_reply([
-                    ("點數配置", "點數配置"),
-                    ("匯入牌路", "匯入牌路"),
-                    ("開始分析", "開始分析"),
-                    ("結束分析", "結束分析"),
-                ]),
-            )
+            reply_message(reply_token, member_guide_text(), quick_items=qr_main(is_admin))
             continue
 
         if text == "綁定帳號":
             update_user_fields(user_id, pending_flow="bind_game_account")
-            reply_message(
-                reply_token,
-                "請輸入你的遊戲帳號\n例如：ck76888",
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
-            )
+            reply_message(reply_token, "請輸入你的遊戲帳號\n例如：ck76888", quick_items=qr_main(is_admin))
             continue
 
         if text == "查詢資格":
-            reply_message(
-                reply_token,
-                get_status_text(user),
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
-            )
+            reply_message(reply_token, get_status_text(user), quick_items=qr_main(is_admin))
             continue
 
-        # =========================
-        # Point config commands
-        # =========================
+        # Point config flow
         if text in ["點數配置", "本金配置"]:
             update_user_fields(user_id, pending_flow="point_range")
             reply_message(
                 reply_token,
-                point_setup_intro(),
-                quick_items=point_range_quick_reply(),
+                "💰 點數配置\n\n請選擇你的點數區間。",
+                quick_items=qr_point_ranges(),
+            )
+            continue
+
+        if text.startswith("點數_"):
+            key = text.replace("點數_", "", 1)
+            if key not in POINT_CONFIG:
+                reply_message(reply_token, "點數區間錯誤，請重新選擇。", quick_items=qr_point_ranges())
+                continue
+            update_user_fields(user_id, point_range=key, pending_flow="play_mode")
+            reply_message(
+                reply_token,
+                f"已選擇：{POINT_CONFIG[key]['label']}\n\n請選擇打法模式。",
+                quick_items=qr_modes(),
+            )
+            continue
+
+        if text.startswith("打法_"):
+            mode = text.replace("打法_", "", 1)
+            if mode not in ["保守", "標準", "積極"]:
+                reply_message(reply_token, "打法模式錯誤，請重新選擇。", quick_items=qr_modes())
+                continue
+            update_user_fields(user_id, play_mode=mode, pending_flow="target_profit")
+            reply_message(
+                reply_token,
+                f"已選擇：{mode}\n\n請選擇期望獲利。",
+                quick_items=qr_targets(),
+            )
+            continue
+
+        if text.startswith("獲利_"):
+            target = text.replace("獲利_", "", 1) + "%"
+            user = update_user_fields(user_id, target_profit=target, pending_flow=None)
+            reply_message(
+                reply_token,
+                point_config_card(user),
+                quick_items=qr_after_config(),
             )
             continue
 
         if text == "查詢配置":
-            reply_message(
-                reply_token,
-                point_config_card(user),
-                quick_items=after_config_quick_reply(),
-            )
+            reply_message(reply_token, point_config_card(user), quick_items=qr_after_config())
             continue
 
-        if text == "重設配置":
-            user = update_user_fields(
-                user_id,
-                point_range=None,
-                point_mode=None,
-                profit_target=None,
-                win_streak=0,
-                loss_streak=0,
-                round_hits=0,
-                round_total=0,
-            )
-            reply_message(
-                reply_token,
-                "已重設點數配置。\n\n請重新點選【點數配置】。",
-                quick_items=make_quick_reply([("點數配置", "點數配置")]),
-            )
-            continue
-
-        # =========================
-        # Road commands
-        # =========================
+        # Road / Analysis
         if text == "匯入牌路":
             update_user_fields(user_id, pending_flow="import_road")
             reply_message(
@@ -1714,7 +1466,7 @@ def callback():
                 "格式例如：\n"
                 "莊莊莊閒莊閒莊閒莊莊閒閒莊閒莊\n\n"
                 "至少15把才可啟動分析。",
-                quick_items=base_quick_reply(is_admin, False),
+                quick_items=qr_main(is_admin),
             )
             continue
 
@@ -1723,53 +1475,49 @@ def callback():
                 reply_message(
                     reply_token,
                     f"請先匯入至少 {MIN_IMPORT_HANDS} 把牌路，再開始分析。",
-                    quick_items=base_quick_reply(is_admin, False),
+                    quick_items=qr_main(is_admin),
                 )
                 continue
 
             user = update_user_fields(
                 user_id,
                 analysis_active=True,
+                round_win=0,
+                round_loss=0,
                 win_streak=0,
                 loss_streak=0,
-                round_hits=0,
-                round_total=0,
             )
             create_analysis_log(user_id, user["current_road"] or [])
-
-            card = prediction_card(user["current_road"] or [], user)
-
             reply_message(
                 reply_token,
-                "分析已啟動\n\n"
-                f"{card}\n\n"
-                "之後每開一口，直接按 莊 / 閒 / 和。\n"
-                "本輪結束請按【結束分析】。",
-                quick_items=base_quick_reply(is_admin, True),
+                "分析已啟動\n\n" + decision_card(user, user["current_road"] or []),
+                quick_items=qr_analysis(),
             )
             continue
 
+        if text == "詳細分析":
+            if not user["analysis_active"]:
+                reply_message(reply_token, "目前尚未開始分析，請先匯入牌路並點選【開始分析】。", quick_items=qr_main(is_admin))
+                continue
+            reply_message(reply_token, detail_card(user, user["current_road"] or []), quick_items=qr_analysis())
+            continue
+
         if text == "結束分析":
+            total = (user.get("round_win") or 0) + (user.get("round_loss") or 0)
+            rate = round((user.get("round_win") or 0) * 100 / total) if total else 0
             user = update_user_fields(
                 user_id,
                 analysis_active=False,
                 imported_ready=False,
                 current_road=[],
                 pending_flow=None,
-                win_streak=0,
-                loss_streak=0,
-                round_hits=0,
-                round_total=0,
             )
             reply_message(
                 reply_token,
-                "已結束本輪分析，牌路與本輪紀錄已清空。\n\n"
-                "下一輪請重新點選【匯入牌路】。",
-                quick_items=make_quick_reply([
-                    ("匯入牌路", "匯入牌路"),
-                    ("點數配置", "點數配置"),
-                    ("會員說明", "會員說明"),
-                ]),
+                "📊 本輪已結束\n\n"
+                f"本輪紀錄：{user.get('round_win', 0)}/{total}（{rate}%）\n\n"
+                "你可以重新匯入牌路，或調整點數配置。",
+                quick_items=qr_after_end(),
             )
             continue
 
@@ -1777,12 +1525,13 @@ def callback():
             if not user["analysis_active"]:
                 reply_message(
                     reply_token,
-                    "請先完成：\n1. 匯入牌路\n2. 開始分析\n\n之後再逐口輸入 莊 / 閒 / 和",
-                    quick_items=base_quick_reply(is_admin, False),
+                    "請先完成：\n1. 匯入牌路\n2. 開始分析\n\n之後再逐口輸入 莊 / 閒 / 和。",
+                    quick_items=qr_main(is_admin),
                 )
                 continue
 
-            user = backfill_previous_actual_and_update_streak(user, text)
+            is_hit = backfill_previous_actual(user_id, text)
+            user = update_round_record(user_id, is_hit)
 
             road = user["current_road"] or []
             road.append(text)
@@ -1791,13 +1540,11 @@ def callback():
             user = update_user_fields(user_id, current_road=road)
             create_analysis_log(user_id, user["current_road"] or [])
 
-            latest_user = get_user(user_id)
-            card = prediction_card(latest_user["current_road"] or [], latest_user)
-
+            latest = get_user(user_id)
             reply_message(
                 reply_token,
-                f"已記錄：{text}\n\n{card}",
-                quick_items=base_quick_reply(is_admin, True),
+                f"已記錄：{text}\n\n" + decision_card(latest, latest["current_road"] or []),
+                quick_items=qr_analysis(),
             )
             continue
 
@@ -1806,27 +1553,15 @@ def callback():
             reply_message(
                 reply_token,
                 f"目前牌路：\n{road_text(user['current_road'] or [], limit)}",
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
-            )
-            continue
-
-        if text == "詳細分析":
-            card = detail_card(user["current_road"] or [], user)
-            card = append_vip_extras(card, user, user_id)
-            reply_message(
-                reply_token,
-                card,
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
+                quick_items=qr_analysis() if user["analysis_active"] else qr_main(is_admin),
             )
             continue
 
         if text == "分析":
-            card = prediction_card(user["current_road"] or [], user)
-            reply_message(
-                reply_token,
-                card,
-                quick_items=base_quick_reply(is_admin, user["analysis_active"]),
-            )
+            if not user["analysis_active"]:
+                reply_message(reply_token, "目前尚未開始分析，請先匯入牌路並點選【開始分析】。", quick_items=qr_main(is_admin))
+                continue
+            reply_message(reply_token, decision_card(user, user["current_road"] or []), quick_items=qr_analysis())
             continue
 
         if text == "重設":
@@ -1836,25 +1571,21 @@ def callback():
                 imported_ready=False,
                 analysis_active=False,
                 pending_flow=None,
+                round_win=0,
+                round_loss=0,
                 win_streak=0,
                 loss_streak=0,
-                round_hits=0,
-                round_total=0,
             )
-            reply_message(
-                reply_token,
-                "已重設當前牌路與分析狀態。",
-                quick_items=base_quick_reply(is_admin, False),
-            )
+            reply_message(reply_token, "已重設當前牌路與分析狀態。", quick_items=qr_main(is_admin))
             continue
 
         reply_message(
             reply_token,
             "你剛剛說："
             f"{text}\n\n"
-            "可用功能：開始 / 點數配置 / 會員說明 / 匯入牌路 / 開始分析 / "
-            "牌路 / 分析 / 詳細分析 / 結束分析 / 綁定帳號 / 查詢資格",
-            quick_items=base_quick_reply(is_admin, user["analysis_active"]),
+            "可用功能：開始 / 點數配置 / 綁定帳號 / 匯入牌路 / 開始分析 / "
+            "莊 / 閒 / 和 / 詳細分析 / 結束分析 / 會員說明",
+            quick_items=qr_main(is_admin),
         )
 
     return "OK", 200
