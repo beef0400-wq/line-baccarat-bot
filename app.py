@@ -76,6 +76,23 @@ TARGET_MULTIPLIER = {
     "100%": 2.0,
 }
 
+POINT_RANGE_INPUT_MAP = {
+    "1000點以下": "1000以下",
+    "1000以下": "1000以下",
+    "1000～3000點": "1000-3000",
+    "1000-3000": "1000-3000",
+    "3000～5000點": "3000-5000",
+    "3000-5000": "3000-5000",
+    "5000～10000點": "5000-10000",
+    "5000-10000": "5000-10000",
+    "10000～30000點": "10000-30000",
+    "10000-30000": "10000-30000",
+    "30000點以上": "30000以上",
+    "30000以上": "30000以上",
+}
+
+PLAY_MODE_INPUTS = ["保守", "標準", "積極", "極限"]
+TARGET_INPUTS = ["30%", "50%", "100%"]
 
 # =========================
 # Basic helpers
@@ -115,6 +132,8 @@ def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS round_loss INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS win_streak INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS loss_streak INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS max_win_streak INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS max_loss_streak INTEGER NOT NULL DEFAULT 0;",
         "CREATE INDEX IF NOT EXISTS idx_users_game_account ON users(game_account);",
         """
         CREATE TABLE IF NOT EXISTS analysis_logs (
@@ -179,34 +198,31 @@ def qr_main(is_admin=False):
 
 def qr_point_ranges():
     return qr([
-        ("1000以下", "點數_1000以下"),
-        ("1000-3000", "點數_1000-3000"),
-        ("3000-5000", "點數_3000-5000"),
-        ("5000-10000", "點數_5000-10000"),
-        ("10000-30000", "點數_10000-30000"),
-        ("30000以上", "點數_30000以上"),
+        ("1000以下", "1000點以下"),
+        ("1000-3000", "1000～3000點"),
+        ("3000-5000", "3000～5000點"),
+        ("5000-10000", "5000～10000點"),
+        ("10000-30000", "10000～30000點"),
+        ("30000以上", "30000點以上"),
         ("返回", "開始"),
     ])
 
-
 def qr_modes():
     return qr([
-        ("保守", "打法_保守"),
-        ("標準", "打法_標準"),
-        ("積極", "打法_積極"),
-        ("極限", "打法_極限"),
+        ("保守", "保守"),
+        ("標準", "標準"),
+        ("積極", "積極"),
+        ("極限", "極限"),
         ("返回", "點數配置"),
     ])
-
 
 def qr_targets():
     return qr([
-        ("30%", "獲利_30"),
-        ("50%", "獲利_50"),
-        ("100%", "獲利_100"),
+        ("30%", "30%"),
+        ("50%", "50%"),
+        ("100%", "100%"),
         ("返回", "點數配置"),
     ])
-
 
 def qr_after_config():
     return qr([
@@ -354,6 +370,8 @@ def update_user_fields(line_user_id, **fields):
                     round_loss = %s,
                     win_streak = %s,
                     loss_streak = %s,
+                    max_win_streak = %s,
+                    max_loss_streak = %s,
                     updated_at = %s
                 WHERE line_user_id = %s
                 RETURNING *
@@ -374,6 +392,8 @@ def update_user_fields(line_user_id, **fields):
                     fields.get("round_loss", current.get("round_loss", 0)),
                     fields.get("win_streak", current.get("win_streak", 0)),
                     fields.get("loss_streak", current.get("loss_streak", 0)),
+                    fields.get("max_win_streak", current.get("max_win_streak", 0)),
+                    fields.get("max_loss_streak", current.get("max_loss_streak", 0)),
                     now_tw(),
                     line_user_id,
                 ),
@@ -865,7 +885,7 @@ def prediction_v6(road):
 
 
 # =========================
-# Points / decision
+# Points / decision V9
 # =========================
 def point_range_text(user):
     key = user.get("point_range")
@@ -887,26 +907,64 @@ def apply_target_multiplier(low, high, target_profit):
     return int(low * multiplier), int(high * multiplier), multiplier
 
 
-def apply_streak_adjustment(low, high, user):
-    mode = user.get("play_mode") or "保守"
-    win_streak = user.get("win_streak") or 0
-    loss_streak = user.get("loss_streak") or 0
+def get_system_state(data, user):
+    win = user.get("win_streak") or 0
+    loss = user.get("loss_streak") or 0
+    risk = data.get("risk", "中")
+    stability = data.get("subroad", {}).get("stability_score", 50)
+    gap = abs(data.get("banker_pct", 50) - data.get("player_pct", 50))
+    signal = data.get("signal", "弱")
 
-    if loss_streak >= 3:
-        return 0, 0, "⛔ 連續失利，暫停本輪"
+    if loss >= 3 or risk == "高":
+        return "⛔ 暫停"
+    if loss == 2:
+        return "⚠️ 降速"
+    if win >= 3 and stability >= 60 and signal in ["中強", "強"]:
+        return "🔥 強攻中"
+    if win >= 2 and stability >= 55:
+        return "🔥 進攻中"
+    if gap >= 14 and stability >= 45 and signal in ["中", "中強", "強"]:
+        return "✅ 可啟動"
+    if stability >= 45:
+        return "👀 觀察中"
+    return "⛔ 暫停"
 
-    if loss_streak == 2:
-        return int(low * 0.5), int(high * 0.5), "⚠️ 連失2次，降至50%"
 
-    if win_streak >= 3:
+def recommend_mode(data, user):
+    stability = data.get("subroad", {}).get("stability_score", 50)
+    signal = data.get("signal", "弱")
+    risk = data.get("risk", "中")
+    target = user.get("target_profit") or "30%"
+    win = user.get("win_streak") or 0
+    loss = user.get("loss_streak") or 0
+
+    if risk == "高" or loss >= 2:
+        return "保守"
+    if target == "100%" and stability >= 70 and signal in ["中強", "強"] and win >= 2:
+        return "極限"
+    if target in ["50%", "100%"] and stability >= 60 and signal in ["中強", "強"]:
+        return "積極"
+    if stability >= 45:
+        return "標準"
+    return "保守"
+
+
+def apply_state_to_points(low, high, state, mode):
+    if "暫停" in state:
+        return 0, 0, "⛔ 暫停啟動"
+    if "降速" in state:
+        return int(low * 0.5), int(high * 0.5), "⚠️ 降速50%"
+    if "強攻" in state:
         if mode == "極限":
-            return int(low * 2.0), int(high * 2.0), "🔥 極限爆發"
-        return int(low * 1.6), int(high * 1.6), "🔥 連順放大"
-
-    if win_streak == 2:
-        return int(low * 1.3), int(high * 1.3), "⬆️ 連順提升"
-
-    return low, high, "正常"
+            return int(low * 2.0), int(high * 2.0), "🔥 極限強攻"
+        return int(low * 1.7), int(high * 1.7), "🔥 強攻放大"
+    if "進攻" in state:
+        if mode == "極限":
+            return int(low * 1.6), int(high * 1.6), "🔥 極限進攻"
+        return int(low * 1.4), int(high * 1.4), "🔥 進攻中"
+    if "可啟動" in state:
+        return low, high, "✅ 正常啟動"
+    return int(low * 0.7), int(high * 0.7), "👀 觀察低區間"
 
 
 def get_final_points(user, data=None):
@@ -917,32 +975,10 @@ def get_final_points(user, data=None):
     base_low, base_high = base
     target = user.get("target_profit") or "30%"
     target_low, target_high, multiplier = apply_target_multiplier(base_low, base_high, target)
-    final_low, final_high, state = apply_streak_adjustment(target_low, target_high, user)
 
-    if data:
-        if data.get("risk") == "高":
-            return {
-                "base": base,
-                "target_low": target_low,
-                "target_high": target_high,
-                "final_low": 0,
-                "final_high": 0,
-                "state": "⛔ 風險高，暫停啟動點數",
-                "multiplier": multiplier,
-                "target": target,
-            }
-
-        if data.get("subroad", {}).get("stability_score", 50) < 40:
-            return {
-                "base": base,
-                "target_low": target_low,
-                "target_high": target_high,
-                "final_low": 0,
-                "final_high": 0,
-                "state": "⛔ 結構混亂，暫停啟動點數",
-                "multiplier": multiplier,
-                "target": target,
-            }
+    state = get_system_state(data, user) if data else "✅ 可啟動"
+    mode = user.get("play_mode") or "保守"
+    final_low, final_high, point_state = apply_state_to_points(target_low, target_high, state, mode)
 
     return {
         "base": base,
@@ -951,55 +987,102 @@ def get_final_points(user, data=None):
         "final_low": final_low,
         "final_high": final_high,
         "state": state,
+        "point_state": point_state,
         "multiplier": multiplier,
         "target": target,
+        "recommended_mode": recommend_mode(data, user) if data else mode,
     }
+
+
+def point_config_card(user):
+    key = user.get("point_range")
+    mode = user.get("play_mode")
+    target = user.get("target_profit")
+
+    if not key:
+        return (
+            "💰 點數配置\n\n"
+            "請先選擇點數區間。\n\n"
+            "流程：\n"
+            "1. 選擇點數區間\n"
+            "2. 選擇打法模式\n"
+            "3. 選擇期望獲利\n\n"
+            "完成後即可匯入牌路。"
+        )
+
+    if not mode:
+        return (
+            "💰 點數配置\n\n"
+            f"點數區間：{POINT_CONFIG[key]['label']}\n\n"
+            "請選擇打法模式。"
+        )
+
+    fp = get_final_points(user)
+    if fp:
+        base_low, base_high = fp["base"]
+        base_text = f"{base_low}點" if base_low == base_high else f"{base_low}～{base_high}點"
+        target_text = f"{fp['target_low']}點" if fp["target_low"] == fp["target_high"] else f"{fp['target_low']}～{fp['target_high']}點"
+        final_text = "暫停" if fp["final_low"] == 0 else (f"{fp['final_low']}點" if fp["final_low"] == fp["final_high"] else f"{fp['final_low']}～{fp['final_high']}點")
+        unit_text = f"基礎：{base_text}\n期望倍率後：{target_text}\n目前狀態：{final_text}（{fp['point_state']}）"
+    else:
+        unit_text = "尚未設定"
+
+    target_text = target if target else "尚未設定"
+
+    return (
+        "💰 點數配置完成\n\n"
+        f"點數區間：{POINT_CONFIG[key]['label']}\n"
+        f"打法模式：{mode}\n"
+        f"期望獲利：{target_text}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"參考點數：\n{unit_text}\n\n"
+        "節奏控管：\n"
+        "👉 期望30%：基礎倍率 ×0.8\n"
+        "👉 期望50%：基礎倍率 ×1.2\n"
+        "👉 期望100%：基礎倍率 ×2.0\n"
+        "👉 觀察中：低區間70%\n"
+        "👉 進攻中：放大40%～60%\n"
+        "👉 強攻中：放大70%｜極限最高100%\n"
+        "👉 降速：降至50%\n"
+        "👉 暫停：不啟動點數\n\n"
+        "✅ 配置完成\n"
+        "下一步：請點選【匯入牌路】。"
+    )
 
 
 def point_decision_text(user, data):
     fp = get_final_points(user, data)
     if not fp:
-        return "點數配置：尚未設定，請先點選【點數配置】。"
+        return "尚未設定，請先點選【點數配置】。"
 
     if fp["final_low"] == 0:
-        return f"本輪：{fp['state']}"
+        return f"{fp['point_state']}"
 
     low = fp["final_low"]
     high = fp["final_high"]
     if low == high:
-        return f"本輪：參考 {low}點（{fp['state']}）"
-    return f"本輪：參考 {low}～{high}點（{fp['state']}）"
+        return f"{low}點（{fp['point_state']}）"
+    return f"{low}～{high}點（{fp['point_state']}）"
 
 
 def decision_card(user, road):
     data = prediction_v6(road)
-    status, reason = decision_status(data)
-
-    direction_line = f"👉👉👉 {data['direction']} {data['direction_pct']}% 👈👈👈"
+    fp = get_final_points(user, data)
+    state = fp["state"] if fp else "👀 觀察中"
     point_text = point_decision_text(user, data)
 
     return (
-        "🎯 方向決策輔助\n\n"
-        f"{direction_line}\n\n"
+        "🎯 方向\n\n"
+        f"👉👉👉 {data['direction']} {data['direction_pct']}% 👈👈👈\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "🧠 AI 判斷\n\n"
-        f"{status}\n"
-        f"原因：{reason}\n\n"
+        "🧠 系統狀態\n"
+        f"{state}\n\n"
+        "💰 點數\n"
+        f"👉 {point_text}\n\n"
+        f"⚠️ 風險：{data['risk']}\n"
+        f"📌 建議模式：{fp['recommended_mode'] if fp else '保守'}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "⚡ 快速判斷\n\n"
-        f"信號：{data['signal']}\n"
-        f"風險：{data['risk']}\n"
-        f"型態：{data['structure_note']}\n"
-        f"尾段：{data['tail_note']}\n"
-        f"下三路：{data['subroad']['big_eye']} / {data['subroad']['small']} / {data['subroad']['cockroach']}（穩定度{data['subroad']['stability_score']}）\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "💰 點數引擎\n\n"
-        f"{point_text}\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "📌 操作\n\n"
-        "👉 繼續輸入：莊 / 閒 / 和\n"
-        "👉 查看細節：詳細分析\n"
-        "👉 結束本輪：結束分析"
+        "操作：莊 / 閒 / 和 / 詳細分析 / 結束分析"
     )
 
 
@@ -1008,20 +1091,24 @@ def detail_card(user, road):
     seq = filter_main_road(road)[-30:]
     details = "\n".join([f"・{x}" for x in data["match_details"]]) if data["match_details"] else "・目前無足夠重複樣本"
     fp = get_final_points(user, data)
+
     if fp:
         base_low, base_high = fp["base"]
         base_unit = f"{base_low}點" if base_low == base_high else f"{base_low}～{base_high}點"
         target_unit = f"{fp['target_low']}點" if fp["target_low"] == fp["target_high"] else f"{fp['target_low']}～{fp['target_high']}點"
         if fp["final_low"] == 0:
-            point_unit = f"基礎：{base_unit}\n期望倍率後：{target_unit}\n目前：暫停（{fp['state']}）"
+            point_unit = f"基礎：{base_unit}\n期望倍率後：{target_unit}\n目前：暫停（{fp['point_state']}）"
         else:
             final_unit = f"{fp['final_low']}點" if fp["final_low"] == fp["final_high"] else f"{fp['final_low']}～{fp['final_high']}點"
-            point_unit = f"基礎：{base_unit}\n期望倍率後：{target_unit}\n目前：{final_unit}（{fp['state']}）"
+            point_unit = f"基礎：{base_unit}\n期望倍率後：{target_unit}\n目前：{final_unit}（{fp['point_state']}）"
     else:
         point_unit = "尚未設定"
 
+    total = (user.get("round_win") or 0) + (user.get("round_loss") or 0)
+    rate = round((user.get("round_win") or 0) * 100 / total) if total else 0
+
     return (
-        "📊 詳細分析 V6\n\n"
+        "📊 詳細分析 V9\n\n"
         f"目前牌路：\n{road_text(seq[-20:])}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "預測機率：\n"
@@ -1051,14 +1138,53 @@ def detail_card(user, road):
         f"平均段長：{data['metrics']['平均段長']}\n"
         f"最長連續：{data['metrics']['最長連續']}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "💰 點數配置\n"
+        "💰 點數引擎\n"
         f"點數區間：{point_range_text(user)}\n"
         f"打法模式：{user.get('play_mode') or '尚未設定'}\n"
         f"期望獲利：{user.get('target_profit') or '尚未設定'}\n"
-        f"參考點數：\n{point_unit}\n"
-        f"本輪紀錄：{user.get('round_win', 0)}/{user.get('round_win', 0) + user.get('round_loss', 0)}\n"
+        f"系統狀態：{fp['state'] if fp else '尚未設定'}\n"
+        f"建議模式：{fp['recommended_mode'] if fp else '尚未設定'}\n"
+        f"參考點數：\n{point_unit}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "📈 本輪表現\n"
+        f"本輪紀錄：{user.get('round_win', 0)}/{total}（{rate}%）\n"
         f"連續順利：{user.get('win_streak', 0)}\n"
-        f"連續失利：{user.get('loss_streak', 0)}"
+        f"連續失利：{user.get('loss_streak', 0)}\n"
+        f"最大連順：{user.get('max_win_streak', 0)}\n"
+        f"最大連失：{user.get('max_loss_streak', 0)}"
+    )
+
+
+def settlement_card(user):
+    total = (user.get("round_win") or 0) + (user.get("round_loss") or 0)
+    win = user.get("round_win") or 0
+    rate = round(win * 100 / total) if total else 0
+    max_win = user.get("max_win_streak") or 0
+    max_loss = user.get("max_loss_streak") or 0
+
+    if rate >= 70 and max_loss <= 1:
+        eval_text = "表現強勢，下輪可維持積極或極限。"
+        next_mode = "積極 / 極限"
+    elif rate >= 55:
+        eval_text = "表現穩定，下輪建議標準或積極。"
+        next_mode = "標準 / 積極"
+    elif max_loss >= 3:
+        eval_text = "波動偏大，下輪建議保守觀察。"
+        next_mode = "保守"
+    else:
+        eval_text = "表現普通，下輪建議標準模式。"
+        next_mode = "標準"
+
+    return (
+        "📊 本輪結算\n\n"
+        f"結果：{win} / {total}\n"
+        f"命中率：{rate}%\n"
+        f"最大連順：{max_win}\n"
+        f"最大連失：{max_loss}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🧠 評價\n"
+        f"{eval_text}\n\n"
+        f"👉 建議下輪：{next_mode}"
     )
 
 
@@ -1135,19 +1261,25 @@ def update_round_record(user_id, is_hit):
         return user
 
     if is_hit:
+        new_win_streak = (user.get("win_streak") or 0) + 1
+        max_win = max(user.get("max_win_streak") or 0, new_win_streak)
         return update_user_fields(
             user_id,
             round_win=(user.get("round_win") or 0) + 1,
-            win_streak=(user.get("win_streak") or 0) + 1,
+            win_streak=new_win_streak,
             loss_streak=0,
+            max_win_streak=max_win,
         )
+
+    new_loss_streak = (user.get("loss_streak") or 0) + 1
+    max_loss = max(user.get("max_loss_streak") or 0, new_loss_streak)
     return update_user_fields(
         user_id,
         round_loss=(user.get("round_loss") or 0) + 1,
-        loss_streak=(user.get("loss_streak") or 0) + 1,
+        loss_streak=new_loss_streak,
         win_streak=0,
+        max_loss_streak=max_loss,
     )
-
 
 def hit_rate_summary(line_user_id):
     with get_conn() as conn:
@@ -1399,6 +1531,8 @@ def callback():
                 round_loss=0,
                 win_streak=0,
                 loss_streak=0,
+                max_win_streak=0,
+                max_loss_streak=0,
             )
             imported_user = get_user(user_id)
             reply_message(
@@ -1444,6 +1578,35 @@ def callback():
             )
             continue
 
+        if user.get("pending_flow") == "point_range" and text in POINT_RANGE_INPUT_MAP:
+            key = POINT_RANGE_INPUT_MAP[text]
+            update_user_fields(user_id, point_range=key, pending_flow="play_mode")
+            reply_message(
+                reply_token,
+                f"已選擇：{POINT_CONFIG[key]['label']}\n\n請選擇打法模式。",
+                quick_items=qr_modes(),
+            )
+            continue
+
+        if user.get("pending_flow") == "play_mode" and text in PLAY_MODE_INPUTS:
+            update_user_fields(user_id, play_mode=text, pending_flow="target_profit")
+            reply_message(
+                reply_token,
+                f"已選擇：{text}\n\n請選擇期望獲利。",
+                quick_items=qr_targets(),
+            )
+            continue
+
+        if user.get("pending_flow") == "target_profit" and text in TARGET_INPUTS:
+            user = update_user_fields(user_id, target_profit=text, pending_flow=None)
+            reply_message(
+                reply_token,
+                point_config_card(user),
+                quick_items=qr_after_config(),
+            )
+            continue
+
+        # Backward-compatible old quick-reply commands
         if text.startswith("點數_"):
             key = text.replace("點數_", "", 1)
             if key not in POINT_CONFIG:
@@ -1513,6 +1676,8 @@ def callback():
                 round_loss=0,
                 win_streak=0,
                 loss_streak=0,
+                max_win_streak=0,
+                max_loss_streak=0,
             )
             create_analysis_log(user_id, user["current_road"] or [])
             reply_message(
@@ -1530,9 +1695,8 @@ def callback():
             continue
 
         if text == "結束分析":
-            total = (user.get("round_win") or 0) + (user.get("round_loss") or 0)
-            rate = round((user.get("round_win") or 0) * 100 / total) if total else 0
-            user = update_user_fields(
+            summary = settlement_card(user)
+            update_user_fields(
                 user_id,
                 analysis_active=False,
                 imported_ready=False,
@@ -1541,9 +1705,7 @@ def callback():
             )
             reply_message(
                 reply_token,
-                "📊 本輪已結束\n\n"
-                f"本輪紀錄：{user.get('round_win', 0)}/{total}（{rate}%）\n\n"
-                "你可以重新匯入牌路，或調整點數配置。",
+                summary + "\n\n你可以重新匯入牌路，或調整點數配置。",
                 quick_items=qr_after_end(),
             )
             continue
@@ -1602,6 +1764,8 @@ def callback():
                 round_loss=0,
                 win_streak=0,
                 loss_streak=0,
+                max_win_streak=0,
+                max_loss_streak=0,
             )
             reply_message(reply_token, "已重設當前牌路與分析狀態。", quick_items=qr_main(is_admin))
             continue
