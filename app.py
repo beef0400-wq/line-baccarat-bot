@@ -1,3 +1,4 @@
+
 from flask import Flask, request, abort
 import os
 import json
@@ -15,17 +16,33 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-ADMIN_USER_IDS = set(x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip())
+ADMIN_USER_IDS = set(
+    x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
+)
 
 TZ_TW = timezone(timedelta(hours=8))
 TIMEOUT_MINUTES = 20
 MAX_ROAD = 100
 MIN_IMPORT_HANDS = 15
+TRIAL_HOURS = 3
 
 FUND_CONFIG = {
     "保守": {"base": (5, 7), "loss": (20, 33), "win": (30, 50)},
     "標準": {"base": (8, 12), "loss": (30, 45), "win": (50, 70)},
     "積極": {"base": (12, 18), "loss": (45, 60), "win": (70, 100)},
+}
+
+FUND_AMOUNT_OPTIONS = {
+    "本金_3000以下": {"label": "3千以下", "value": 3000},
+    "本金_3000_10000": {"label": "3千～1萬", "value": 10000},
+    "本金_10000_30000": {"label": "1萬～3萬", "value": 30000},
+    "本金_30000以上": {"label": "3萬以上", "value": 50000},
+}
+
+FUND_TARGET_OPTIONS = {
+    "獲利_30": {"label": "30%", "value": 30},
+    "獲利_50": {"label": "50%", "value": 50},
+    "獲利_100": {"label": "100%", "value": 100},
 }
 
 
@@ -60,8 +77,8 @@ def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_initial INTEGER NULL;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_mode TEXT NULL;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_delta INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_range_text TEXT NULL;",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_target_pct INTEGER NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_target INTEGER NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS fund_amount_label TEXT NULL;",
         "CREATE INDEX IF NOT EXISTS idx_users_game_account ON users(game_account);",
         """
         CREATE TABLE IF NOT EXISTS analysis_logs (
@@ -72,12 +89,15 @@ def init_db():
             player_pct INTEGER NOT NULL,
             pattern TEXT NOT NULL,
             risk TEXT NOT NULL,
+            decision TEXT NULL,
             actual_next_result TEXT NULL,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """,
+        "ALTER TABLE analysis_logs ADD COLUMN IF NOT EXISTS decision TEXT NULL;",
         "CREATE INDEX IF NOT EXISTS idx_analysis_logs_user ON analysis_logs(line_user_id);",
     ]
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             for stmt in statements:
@@ -88,7 +108,11 @@ def init_db():
 def verify_signature(body: bytes, signature: str) -> bool:
     if not LINE_CHANNEL_SECRET:
         return False
-    digest = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).digest()
     expected = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
@@ -111,10 +135,27 @@ def base_quick_reply(is_admin=False, analysis_active=False):
     if analysis_active:
         items = [("莊", "莊"), ("閒", "閒"), ("和", "和"), ("分析", "分析"), ("牌路", "牌路"), ("結束分析", "結束分析")]
     else:
-        items = [("開始", "開始"), ("匯入牌路", "匯入牌路"), ("開始分析", "開始分析"), ("本金配置", "本金配置"), ("會員說明", "會員說明"), ("綁定帳號", "綁定帳號")]
+        items = [("開始", "開始"), ("本金配置", "本金配置"), ("匯入牌路", "匯入牌路"), ("開始分析", "開始分析"), ("會員說明", "會員說明"), ("綁定帳號", "綁定帳號")]
     if is_admin:
         items[-1] = ("/待開通", "/待開通")
     return make_quick_reply(items)
+
+
+def fund_amount_quick_reply():
+    return make_quick_reply([
+        ("3千以下", "本金_3000以下"),
+        ("3千～1萬", "本金_3000_10000"),
+        ("1萬～3萬", "本金_10000_30000"),
+        ("3萬以上", "本金_30000以上"),
+    ])
+
+
+def fund_mode_quick_reply():
+    return make_quick_reply([("保守", "打法_保守"), ("標準", "打法_標準"), ("積極", "打法_積極")])
+
+
+def fund_target_quick_reply():
+    return make_quick_reply([("30%", "獲利_30"), ("50%", "獲利_50"), ("100%", "獲利_100")])
 
 
 def reply_message(reply_token, text, quick_items=None):
@@ -162,11 +203,14 @@ def ensure_user(line_user_id):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                INSERT INTO users (line_user_id, trial_end_at, current_road, pending_flow, analysis_active, imported_ready, last_active_at, created_at, updated_at)
+                INSERT INTO users (
+                    line_user_id, trial_end_at, current_road, pending_flow,
+                    analysis_active, imported_ready, last_active_at, created_at, updated_at
+                )
                 VALUES (%s, %s, %s::jsonb, NULL, FALSE, FALSE, %s, %s, %s)
                 RETURNING *
                 """,
-                (line_user_id, now_tw() + timedelta(hours=3), json.dumps([], ensure_ascii=False), now_tw(), now_tw(), now_tw()),
+                (line_user_id, now_tw() + timedelta(hours=TRIAL_HOURS), json.dumps([], ensure_ascii=False), now_tw(), now_tw(), now_tw()),
             )
             row = cur.fetchone()
         conn.commit()
@@ -195,8 +239,8 @@ def update_user_fields(line_user_id, **fields):
                     fund_initial = %s,
                     fund_mode = %s,
                     fund_delta = %s,
-                    fund_range_text = %s,
-                    fund_target_pct = %s,
+                    fund_target = %s,
+                    fund_amount_label = %s,
                     updated_at = %s
                 WHERE line_user_id = %s
                 RETURNING *
@@ -213,8 +257,8 @@ def update_user_fields(line_user_id, **fields):
                     fields.get("fund_initial", current.get("fund_initial")),
                     fields.get("fund_mode", current.get("fund_mode")),
                     fields.get("fund_delta", current.get("fund_delta", 0)),
-                    fields.get("fund_range_text", current.get("fund_range_text")),
-                    fields.get("fund_target_pct", current.get("fund_target_pct")),
+                    fields.get("fund_target", current.get("fund_target")),
+                    fields.get("fund_amount_label", current.get("fund_amount_label")),
                     now_tw(),
                     line_user_id,
                 ),
@@ -263,7 +307,10 @@ def grant_vip_by_game_account(game_account, days):
     if not user:
         return None, "找不到此遊戲帳號"
     current_expire = user.get("vip_expire_at")
-    new_expire = current_expire + timedelta(days=days) if current_expire and current_expire > now_tw() else now_tw() + timedelta(days=days)
+    if current_expire and current_expire > now_tw():
+        new_expire = current_expire + timedelta(days=days)
+    else:
+        new_expire = now_tw() + timedelta(days=days)
     update_user_fields(user["line_user_id"], vip_expire_at=new_expire)
     return get_user_by_game_account(game_account), None
 
@@ -283,7 +330,8 @@ def list_pending_accounts():
                 """
                 SELECT game_account, line_user_id, created_at
                 FROM users
-                WHERE game_account IS NOT NULL AND (vip_expire_at IS NULL OR vip_expire_at < %s)
+                WHERE game_account IS NOT NULL
+                  AND (vip_expire_at IS NULL OR vip_expire_at < %s)
                 ORDER BY created_at DESC
                 """,
                 (now_tw(),),
@@ -351,11 +399,69 @@ def longest_run(seq):
 
 def avg_segment_length(seq):
     segs = segment_lengths(seq)
-    return round(len(seq) / len(segs), 2) if segs else 0
+    if not segs:
+        return 0
+    return round(len(seq) / len(segs), 2)
 
 
 def transition_rate(seq):
-    return round(alternation_count(seq) * 100 / (len(seq) - 1)) if len(seq) > 1 else 0
+    if len(seq) <= 1:
+        return 0
+    return round(alternation_count(seq) * 100 / (len(seq) - 1))
+
+
+def build_big_road_columns(seq):
+    columns = []
+    if not seq:
+        return columns
+    cur_col = [seq[0]]
+    for item in seq[1:]:
+        if item == cur_col[-1]:
+            cur_col.append(item)
+        else:
+            columns.append(cur_col)
+            cur_col = [item]
+    columns.append(cur_col)
+    return columns
+
+
+def derive_subroad_color(columns, offset):
+    if len(columns) <= offset:
+        return "資料不足"
+    current_len = len(columns[-1])
+    compare_len = len(columns[-1 - offset])
+    if current_len == compare_len:
+        return "紅"
+    if current_len > compare_len and abs(current_len - compare_len) <= 1:
+        return "紅"
+    return "藍"
+
+
+def analyze_subroads(seq):
+    columns = build_big_road_columns(seq)
+    big_eye = derive_subroad_color(columns, 1)
+    small = derive_subroad_color(columns, 2)
+    cockroach = derive_subroad_color(columns, 3)
+    colors = [big_eye, small, cockroach]
+    available = [x for x in colors if x in ["紅", "藍"]]
+    if not available:
+        stability_score = 50
+        stability_label = "資料不足"
+        note = "下三路資料不足，暫以大路結構為主。"
+    else:
+        red_count = available.count("紅")
+        blue_count = available.count("藍")
+        stability_score = round((red_count / len(available)) * 100)
+        if red_count == len(available):
+            stability_label = "高"
+            note = "下三路偏一致，結構穩定度較高。"
+        elif blue_count == len(available):
+            stability_label = "低"
+            note = "下三路偏藍，結構變化較大。"
+        else:
+            stability_label = "中"
+            note = "下三路紅藍交錯，屬於轉折觀察區。"
+    return {"big_eye": big_eye, "small": small, "cockroach": cockroach, "stability_score": stability_score, "stability_label": stability_label, "note": note}
 
 
 def sequence_match_model(seq, max_window=6):
@@ -503,11 +609,12 @@ def recency_weight_model(seq):
     return bonus_b, bonus_p
 
 
-def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label):
+def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label, subroads):
     gap = abs(banker_pct - player_pct)
     t_rate = transition_rate(seq)
     avg_len = avg_segment_length(seq)
-    if gap >= 22 and total_matches >= 2:
+    stability = subroads.get("stability_score", 50)
+    if gap >= 22 and total_matches >= 2 and stability >= 65:
         signal = "強"
     elif gap >= 14 or total_matches >= 1:
         signal = "中強"
@@ -517,20 +624,41 @@ def risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_label)
         signal = "弱"
     if len(seq) < 15:
         risk = "中高"
+    elif stability <= 33:
+        risk = "高"
     elif "混合" in structure_label and gap < 10:
         risk = "高"
     elif t_rate > 75 or avg_len < 1.35:
         risk = "中高"
-    elif gap >= 18 and signal in ["強", "中強"]:
+    elif gap >= 18 and signal in ["強", "中強"] and stability >= 65:
         risk = "中低"
     else:
         risk = "中"
     return signal, risk
 
 
-def prediction_v35(road):
+def ai_decision(data):
+    gap = abs(data["banker_pct"] - data["player_pct"])
+    signal = data["signal"]
+    risk = data["risk"]
+    stability = data["subroads"]["stability_score"]
+    if risk == "高" or gap < 8 or stability <= 33:
+        status = "⛔ 暫停本輪"
+        note = "結構混亂或差距不足，建議先觀察，不急著進入下一步。"
+    elif gap >= 18 and signal in ["強", "中強"] and risk in ["中低", "中"] and stability >= 65:
+        status = "✅ 可觀察進場"
+        note = "訊號與結構穩定度同步偏強，可列入觀察，但仍需依資金區間控管。"
+    else:
+        status = "⚠️ 等待確認"
+        note = "目前有方向但條件未完全同步，建議等待下一口確認結構。"
+    leader = "莊" if data["banker_pct"] >= data["player_pct"] else "閒"
+    return {"status": status, "note": note, "leader": leader}
+
+
+def prediction_v4(road):
     seq = filter_main_road(road)[-30:]
     if not seq:
+        empty_sub = analyze_subroads([])
         return {
             "banker_pct": 50,
             "player_pct": 50,
@@ -542,6 +670,8 @@ def prediction_v35(road):
             "structure_note": "尚無結構資料",
             "match_details": [],
             "metrics": {"莊": 0, "閒": 0, "交錯率": 0, "平均段長": 0, "最長連續": 0},
+            "subroads": empty_sub,
+            "decision": {"status": "⚠️ 等待確認", "note": "資料不足，請先匯入牌路。", "leader": "無"},
         }
     banker = seq.count("莊")
     player = seq.count("閒")
@@ -551,8 +681,18 @@ def prediction_v35(road):
     tb, tp, tail_note = tail_momentum_model(seq)
     sb, sp, structure_note = structure_model(seq)
     mb, mp, total_matches, match_note, match_details = sequence_match_model(seq, max_window=6)
+    subroads = analyze_subroads(seq)
     score_b += rb + tb + sb + mb
     score_p += rp + tp + sp + mp
+    stability = subroads["stability_score"]
+    if stability >= 70:
+        if score_b >= score_p:
+            score_b += 6
+        else:
+            score_p += 6
+    elif stability <= 33:
+        score_b *= 0.96
+        score_p *= 0.96
     if transition_rate(seq) >= 65:
         next_side = "閒" if seq[-1] == "莊" else "莊"
         if next_side == "莊":
@@ -568,8 +708,8 @@ def prediction_v35(road):
     total = max(score_b + score_p, 1)
     banker_pct = round(score_b * 100 / total)
     player_pct = 100 - banker_pct
-    signal, risk = risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_note)
-    return {
+    signal, risk = risk_and_signal(banker_pct, player_pct, seq, total_matches, structure_note, subroads)
+    data = {
         "banker_pct": banker_pct,
         "player_pct": player_pct,
         "pattern": structure_note,
@@ -580,21 +720,42 @@ def prediction_v35(road):
         "structure_note": structure_note,
         "match_details": match_details,
         "metrics": {"莊": banker, "閒": player, "交錯率": transition_rate(seq), "平均段長": avg_segment_length(seq), "最長連續": longest_run(seq)},
+        "subroads": subroads,
     }
+    data["decision"] = ai_decision(data)
+    return data
 
 
 def prediction_card(road):
     seq = filter_main_road(road)[-30:]
-    data = prediction_v35(road)
-    detail_lines = "\n".join([f"・{x}" for x in data["match_details"]]) if data["match_details"] else "・目前無足夠重複樣本"
+    data = prediction_v4(road)
+    if data["match_details"]:
+        detail_lines = "\n".join([f"・{x}" for x in data["match_details"]])
+    else:
+        detail_lines = "・目前無足夠重複樣本"
+    sub = data["subroads"]
+    decision = data["decision"]
     return (
-        "📊 預測判讀 V3.5\n\n"
+        "📊 預測判讀 V4\n\n"
         f"目前牌路：\n{road_text(seq[-20:])}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "預測機率：\n"
         f"👉 莊：{data['banker_pct']}%\n"
         f"👉 閒：{data['player_pct']}%\n\n"
-        f"信號強度：{data['signal']}\n\n"
+        f"信號強度：{data['signal']}\n"
+        f"風險：{data['risk']}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🧠 AI 決策提示\n"
+        f"{decision['status']}\n"
+        f"目前偏向：{decision['leader']}\n"
+        f"{decision['note']}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "下三路結構：\n"
+        f"大眼仔：{sub['big_eye']}\n"
+        f"小路：{sub['small']}\n"
+        f"曱甴路：{sub['cockroach']}\n"
+        f"穩定度：{sub['stability_label']}（{sub['stability_score']}%）\n"
+        f"{sub['note']}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "判斷依據：\n\n"
         "▍序列匹配\n"
@@ -610,9 +771,7 @@ def prediction_card(road):
         f"閒：{data['metrics']['閒']}\n"
         f"交錯率：{data['metrics']['交錯率']}%\n"
         f"平均段長：{data['metrics']['平均段長']}\n"
-        f"最長連續：{data['metrics']['最長連續']}\n\n"
-        "風險：\n"
-        f"{data['risk']}"
+        f"最長連續：{data['metrics']['最長連續']}"
     )
 
 
@@ -624,51 +783,12 @@ def parse_int_after_prefix(text, prefix):
         return None
 
 
-def fund_amount_quick_reply():
-    return make_quick_reply([
-        ("3千以下", "本金_3000以下"),
-        ("3千～1萬", "本金_3000_10000"),
-        ("1萬～3萬", "本金_10000_30000"),
-        ("3萬以上", "本金_30000以上"),
-    ])
-
-
-def fund_mode_quick_reply():
-    return make_quick_reply([
-        ("保守", "打法_保守"),
-        ("標準", "打法_標準"),
-        ("積極", "打法_積極"),
-    ])
-
-
-def fund_target_quick_reply():
-    return make_quick_reply([
-        ("30%", "獲利_30"),
-        ("50%", "獲利_50"),
-        ("100%", "獲利_100"),
-    ])
-
-
-def after_fund_quick_reply():
-    return make_quick_reply([
-        ("匯入牌路", "匯入牌路"),
-        ("開始分析", "開始分析"),
-        ("開始", "開始"),
-        ("會員說明", "會員說明"),
-    ])
-
-
-FUND_AMOUNT_OPTIONS = {
-    "本金_3000以下": ("3千以下", 3000),
-    "本金_3000_10000": ("3千～1萬", 10000),
-    "本金_10000_30000": ("1萬～3萬", 30000),
-    "本金_30000以上": ("3萬以上", 50000),
-}
-
 def fund_status(user):
     initial = user.get("fund_initial")
     mode = user.get("fund_mode") or "保守"
     delta = user.get("fund_delta") or 0
+    target = user.get("fund_target")
+    amount_label = user.get("fund_amount_label")
     if not initial:
         return None
     cfg = FUND_CONFIG.get(mode, FUND_CONFIG["保守"])
@@ -687,32 +807,22 @@ def fund_status(user):
         state = "正常區間"
         note = "目前仍在正常區間，建議維持原本節奏。"
         active_range = f"正常區間：{cfg['base'][0]}%～{cfg['base'][1]}%"
-    return {"initial": initial, "mode": mode, "delta": delta, "pct": pct, "state": state, "note": note, "active_range": active_range, "cfg": cfg}
+    return {"initial": initial, "amount_label": amount_label, "mode": mode, "delta": delta, "pct": pct, "target": target, "state": state, "note": note, "active_range": active_range, "cfg": cfg}
 
 
 def fund_card(user):
     fs = fund_status(user)
-
     if not fs:
-        return (
-            "💰 資金配置\n\n"
-            "尚未完成配置。\n\n"
-            "請點選【本金配置】開始設定：\n"
-            "① 選本金區間\n"
-            "② 選打法模式\n"
-            "③ 選期望獲利\n\n"
-            "也可手動輸入：本金10000 / 模式標準 / 紀錄+500"
-        )
-
+        return "💰 資金配置\n\n尚未設定本金。\n\n請點選【本金配置】開始設定。\n也可手動輸入：本金10000"
     cfg = fs["cfg"]
-    target = user.get("fund_target_pct")
-    range_text = user.get("fund_range_text") or f"{fs['initial']}"
-
+    target_text = f"{fs['target']}%" if fs.get("target") else "未設定"
+    amount_label = fs.get("amount_label") or "自訂本金"
     return (
         "💰 資金配置\n\n"
-        f"本金區間：{range_text}\n"
+        f"本金區間：{amount_label}\n"
+        f"本金估算：{fs['initial']}\n"
         f"模式：{fs['mode']}\n"
-        f"期望獲利：{target if target else '未設定'}%\n"
+        f"期望獲利：{target_text}\n"
         f"目前結果：{fs['delta']}（{fs['pct']}%）\n"
         f"狀態：{fs['state']}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
@@ -727,91 +837,18 @@ def fund_card(user):
     )
 
 
-def fund_setup_start_text():
-    return (
-        "💰 資金配置\n\n"
-        "請先選擇本金區間：\n\n"
-        "① 3千以下\n"
-        "② 3千～1萬\n"
-        "③ 1萬～3萬\n"
-        "④ 3萬以上"
-    )
-
-
-def fund_mode_text(range_text):
-    return (
-        f"已選本金區間：{range_text}\n\n"
-        "請選擇希望的打法模式：\n\n"
-        "保守：5%～7%\n"
-        "標準：8%～12%\n"
-        "積極：12%～18%"
-    )
-
-
-def fund_target_text(mode):
-    return (
-        f"已選打法模式：{mode}\n\n"
-        "請選擇本輪期望獲利：\n\n"
-        "30%：穩定達標\n"
-        "50%：中等目標\n"
-        "100%：高目標"
-    )
-
-
-def fund_complete_text(user):
-    return (
-        "💰 資金配置完成\n\n"
-        + fund_card(user)
-        + "\n\n━━━━━━━━━━━━━━━\n\n"
-        "接下來請點選【匯入牌路】。\n"
-        "輸入至少15把後，即可開始分析。"
-    )
-
-
-def ai_decision_card(road, user=None):
-    data = prediction_v35(road)
-    banker_pct = data["banker_pct"]
-    player_pct = data["player_pct"]
-    gap = abs(banker_pct - player_pct)
-    side = "莊" if banker_pct >= player_pct else "閒"
-
-    if gap >= 18 and data["signal"] in ["強", "中強"] and data["risk"] != "高":
-        decision = "✅ 可觀察進場"
-        note = "目前信號較集中，可列入觀察，但仍需依資金配置控制區間。"
-    elif gap >= 8 and data["risk"] != "高":
-        decision = "⚠️ 等待確認"
-        note = "目前有方向，但信號尚未完全集中，建議等下一口確認節奏。"
-    else:
-        decision = "⛔ 暫停本輪"
-        note = "目前差距不明顯或風險偏高，建議暫停觀察。"
-
-    fund_line = "尚未設定資金配置"
-    if user:
-        fs = fund_status(user)
-        if fs:
-            fund_line = f"{fs['mode']}｜{fs['active_range']}"
-
-    return (
-        "🧠 AI 決策提示\n\n"
-        f"目前傾向：{side}\n"
-        f"機率差距：{gap}%\n"
-        f"信號強度：{data['signal']}\n"
-        f"風險：{data['risk']}\n\n"
-        f"操作判斷：\n{decision}\n\n"
-        f"資金配置：\n{fund_line}\n\n"
-        f"提示：\n{note}"
-    )
-
 def create_analysis_log(line_user_id, road):
-    data = prediction_v35(road)
+    data = prediction_v4(road)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO analysis_logs (line_user_id, road_snapshot, banker_pct, player_pct, pattern, risk, actual_next_result)
-                VALUES (%s, %s::jsonb, %s, %s, %s, %s, NULL)
+                INSERT INTO analysis_logs (
+                    line_user_id, road_snapshot, banker_pct, player_pct, pattern, risk, decision, actual_next_result
+                )
+                VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s, NULL)
                 """,
-                (line_user_id, json.dumps(filter_main_road(road)[-30:], ensure_ascii=False), data["banker_pct"], data["player_pct"], data["pattern"], data["risk"]),
+                (line_user_id, json.dumps(filter_main_road(road)[-30:], ensure_ascii=False), data["banker_pct"], data["player_pct"], data["pattern"], data["risk"], data["decision"]["status"]),
             )
         conn.commit()
 
@@ -823,9 +860,11 @@ def backfill_previous_actual(line_user_id, actual_result):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT id FROM analysis_logs
+                SELECT id
+                FROM analysis_logs
                 WHERE line_user_id = %s AND actual_next_result IS NULL
-                ORDER BY created_at DESC LIMIT 1
+                ORDER BY created_at DESC
+                LIMIT 1
                 """,
                 (line_user_id,),
             )
@@ -843,7 +882,8 @@ def hit_rate_summary(line_user_id):
                 SELECT banker_pct, player_pct, actual_next_result
                 FROM analysis_logs
                 WHERE line_user_id = %s AND actual_next_result IS NOT NULL
-                ORDER BY created_at DESC LIMIT 30
+                ORDER BY created_at DESC
+                LIMIT 30
                 """,
                 (line_user_id,),
             )
@@ -879,24 +919,28 @@ def member_guide_text():
         "點選【綁定帳號】\n"
         "輸入你的遊戲帳號（例：ck76888）\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "② 匯入牌路\n"
+        "② 本金配置\n"
+        "點選【本金配置】\n"
+        "依序選擇本金區間、打法模式、期望獲利\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "③ 匯入牌路\n"
         "輸入目前牌路\n"
         "（需至少15把以上）\n\n"
         "例：\n"
         "莊莊莊閒莊閒閒莊…\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "③ 開始分析\n"
+        "④ 開始分析\n"
         "點選【開始分析】\n"
         "系統會進入即時模式\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "④ 即時紀錄\n"
+        "⑤ 即時紀錄\n"
         "每開一把輸入：\n\n"
         "👉 莊\n"
         "👉 閒\n"
         "👉 和\n\n"
         "系統會同步更新分析\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "⑤ 結束分析\n"
+        "⑥ 結束分析\n"
         "輸入【結束分析】\n"
         "結算本局紀錄\n\n"
         "━━━━━━━━━━━━━━━\n\n"
@@ -926,19 +970,24 @@ def menu_text(user):
     tag = "VIP會員" if is_vip(user) else ("免費試用中" if in_trial(user) else "免費版")
     return (
         f"歡迎使用百家即時分析助手（{tag}）\n\n"
-        "可用流程：\n"
-        "1. 匯入牌路\n"
-        "2. 開始分析\n"
-        "3. 分析中逐口按 莊 / 閒 / 和\n"
-        "4. 結束分析\n\n"
+        "建議流程：\n"
+        "1. 本金配置\n"
+        "2. 匯入牌路\n"
+        "3. 開始分析\n"
+        "4. 分析中逐口按 莊 / 閒 / 和\n"
+        "5. 結束分析\n\n"
         "常用功能：\n"
-        "牌路\n分析\n本金配置\n會員說明\n綁定帳號\n查詢資格"
+        "本金配置\n"
+        "牌路\n"
+        "分析\n"
+        "會員說明\n"
+        "綁定帳號\n"
+        "查詢資格"
     )
 
 
 def append_vip_extras(card, user, user_id):
     if is_vip(user):
-        card += "\n\n" + ai_decision_card(user.get("current_road") or [], user)
         card += "\n\n" + hit_rate_summary(user_id)
         if user.get("fund_initial"):
             card += "\n\n" + fund_card(user)
@@ -965,6 +1014,7 @@ def callback():
     except Exception as exc:
         print("JSON ERROR:", exc)
         return "OK", 200
+
     for event in data.get("events", []):
         user_id = event.get("source", {}).get("userId")
         print("USER ID:", user_id)
@@ -1043,44 +1093,7 @@ def callback():
                 continue
             update_user_fields(user_id, current_road=parsed[-MAX_ROAD:], pending_flow=None, imported_ready=True, analysis_active=False)
             imported_user = get_user(user_id)
-            reply_message(reply_token, "牌路匯入完成\n\n" + f"目前牌路：\n{road_text(imported_user['current_road'])}\n\n" + "接下來請輸入：開始分析", quick_items=base_quick_reply(is_admin, False))
-            continue
-
-
-        if user.get("pending_flow") == "fund_amount":
-            if text not in FUND_AMOUNT_OPTIONS:
-                reply_message(reply_token, fund_setup_start_text(), quick_items=fund_amount_quick_reply())
-                continue
-
-            range_text, amount = FUND_AMOUNT_OPTIONS[text]
-            user = update_user_fields(
-                user_id,
-                fund_initial=amount,
-                fund_range_text=range_text,
-                fund_delta=0,
-                pending_flow="fund_mode",
-            )
-            reply_message(reply_token, fund_mode_text(range_text), quick_items=fund_mode_quick_reply())
-            continue
-
-        if user.get("pending_flow") == "fund_mode":
-            if text not in ["打法_保守", "打法_標準", "打法_積極"]:
-                reply_message(reply_token, "請選擇打法模式：保守 / 標準 / 積極", quick_items=fund_mode_quick_reply())
-                continue
-
-            mode = text.replace("打法_", "", 1)
-            user = update_user_fields(user_id, fund_mode=mode, pending_flow="fund_target")
-            reply_message(reply_token, fund_target_text(mode), quick_items=fund_target_quick_reply())
-            continue
-
-        if user.get("pending_flow") == "fund_target":
-            if text not in ["獲利_30", "獲利_50", "獲利_100"]:
-                reply_message(reply_token, "請選擇期望獲利：30% / 50% / 100%", quick_items=fund_target_quick_reply())
-                continue
-
-            target = int(text.replace("獲利_", "", 1))
-            user = update_user_fields(user_id, fund_target_pct=target, pending_flow=None)
-            reply_message(reply_token, fund_complete_text(user), quick_items=after_fund_quick_reply())
+            reply_message(reply_token, "牌路匯入完成\n\n" f"目前牌路：\n{road_text(imported_user['current_road'])}\n\n" "接下來請輸入：開始分析", quick_items=base_quick_reply(is_admin, False))
             continue
 
         locked_commands = ["分析", "牌路", "匯入牌路", "開始分析", "莊", "閒", "和", "本金配置", "查詢配置"]
@@ -1091,33 +1104,61 @@ def callback():
         if text == "開始":
             reply_message(reply_token, menu_text(user), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text in ["會員說明", "使用教學", "開通教學"]:
             reply_message(reply_token, member_guide_text(), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "綁定帳號":
             update_user_fields(user_id, pending_flow="bind_game_account")
             reply_message(reply_token, "請輸入你的遊戲帳號\n例如：ck76888", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "查詢資格":
             reply_message(reply_token, get_status_text(user), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "本金配置":
             update_user_fields(user_id, pending_flow="fund_amount")
-            reply_message(reply_token, fund_setup_start_text(), quick_items=fund_amount_quick_reply())
+            reply_message(reply_token, "💰 資金配置\n\n請先選擇本金區間：", quick_items=fund_amount_quick_reply())
             continue
+
+        if user.get("pending_flow") == "fund_amount" and text in FUND_AMOUNT_OPTIONS:
+            option = FUND_AMOUNT_OPTIONS[text]
+            update_user_fields(user_id, fund_initial=option["value"], fund_amount_label=option["label"], fund_delta=0, pending_flow="fund_mode")
+            reply_message(reply_token, f"已選擇本金區間：{option['label']}\n\n請選擇希望的打法模式：", quick_items=fund_mode_quick_reply())
+            continue
+
+        if user.get("pending_flow") == "fund_mode" and text.startswith("打法_"):
+            mode = text.replace("打法_", "", 1)
+            if mode not in FUND_CONFIG:
+                reply_message(reply_token, "模式錯誤，請重新選擇。", quick_items=fund_mode_quick_reply())
+                continue
+            update_user_fields(user_id, fund_mode=mode, pending_flow="fund_target")
+            reply_message(reply_token, f"已選擇：{mode}模式\n\n請選擇本輪期望獲利：", quick_items=fund_target_quick_reply())
+            continue
+
+        if user.get("pending_flow") == "fund_target" and text in FUND_TARGET_OPTIONS:
+            target = FUND_TARGET_OPTIONS[text]
+            user = update_user_fields(user_id, fund_target=target["value"], pending_flow=None)
+            reply_message(reply_token, "資金配置完成\n\n" + fund_card(user) + "\n\n接下來請點選【匯入牌路】，輸入至少15把牌路後開始分析。", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
+            continue
+
         if text.startswith("本金"):
             amount = parse_int_after_prefix(text, "本金")
             if not amount or amount <= 0:
                 reply_message(reply_token, "格式錯誤，請輸入例如：本金10000", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
                 continue
-            user = update_user_fields(user_id, fund_initial=amount, fund_range_text=f"{amount}", fund_delta=0, fund_mode=user.get("fund_mode") or "保守")
+            user = update_user_fields(user_id, fund_initial=amount, fund_amount_label="自訂本金", fund_delta=0, fund_mode=user.get("fund_mode") or "保守")
             reply_message(reply_token, "本金已設定完成\n\n" + fund_card(user), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text in ["模式保守", "模式標準", "模式積極"]:
             mode = text.replace("模式", "", 1)
             user = update_user_fields(user_id, fund_mode=mode)
             reply_message(reply_token, f"已切換為：{mode}模式\n\n" + fund_card(user), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text.startswith("紀錄+") or text.startswith("紀錄-"):
             raw = text.replace("紀錄", "", 1).replace(",", "").strip()
             try:
@@ -1128,30 +1169,37 @@ def callback():
             user = update_user_fields(user_id, fund_delta=(user.get("fund_delta") or 0) + delta_change)
             reply_message(reply_token, "已更新本輪結果\n\n" + fund_card(user), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "查詢配置":
             reply_message(reply_token, fund_card(user), quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "重設配置":
-            user = update_user_fields(user_id, fund_initial=None, fund_mode=None, fund_delta=0)
+            update_user_fields(user_id, fund_initial=None, fund_mode=None, fund_delta=0, fund_target=None, fund_amount_label=None, pending_flow=None)
             reply_message(reply_token, "已重設資金配置。", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "匯入牌路":
             update_user_fields(user_id, pending_flow="import_road")
             reply_message(reply_token, "請一次輸入目前牌路\n格式例如：\n莊莊莊閒莊閒莊閒莊莊閒閒莊閒莊\n\n至少15把才可啟動分析", quick_items=base_quick_reply(is_admin, False))
             continue
+
         if text == "開始分析":
             if not user["imported_ready"]:
                 reply_message(reply_token, f"請先匯入至少 {MIN_IMPORT_HANDS} 把牌路，再開始分析。", quick_items=base_quick_reply(is_admin, False))
                 continue
             user = update_user_fields(user_id, analysis_active=True)
             create_analysis_log(user_id, user["current_road"] or [])
-            card = append_vip_extras(prediction_card(user["current_road"] or []), user, user_id)
-            reply_message(reply_token, "分析已啟動\n\n" + card + "\n\n之後每開一口，直接按 莊 / 閒 / 和", quick_items=base_quick_reply(is_admin, True))
+            card = prediction_card(user["current_road"] or [])
+            card = append_vip_extras(card, user, user_id)
+            reply_message(reply_token, "分析已啟動\n\n" f"{card}\n\n" "之後每開一口，直接按 莊 / 閒 / 和", quick_items=base_quick_reply(is_admin, True))
             continue
+
         if text == "結束分析":
-            user = update_user_fields(user_id, analysis_active=False, imported_ready=False, current_road=[])
+            update_user_fields(user_id, analysis_active=False, imported_ready=False, current_road=[], pending_flow=None)
             reply_message(reply_token, "已結束本輪分析，牌路已清空。\n如要再次使用，請先重新匯入牌路。", quick_items=base_quick_reply(is_admin, False))
             continue
+
         if text in ["莊", "閒", "和"]:
             if not user["analysis_active"]:
                 reply_message(reply_token, "請先完成：\n1. 匯入牌路\n2. 開始分析\n\n之後再逐口輸入 莊 / 閒 / 和", quick_items=base_quick_reply(is_admin, False))
@@ -1163,22 +1211,29 @@ def callback():
             user = update_user_fields(user_id, current_road=road)
             create_analysis_log(user_id, user["current_road"] or [])
             latest_user = get_user(user_id)
-            card = append_vip_extras(prediction_card(latest_user["current_road"] or []), latest_user, user_id)
+            card = prediction_card(latest_user["current_road"] or [])
+            card = append_vip_extras(card, latest_user, user_id)
             reply_message(reply_token, f"已記錄：{text}\n\n{card}", quick_items=base_quick_reply(is_admin, True))
             continue
+
         if text == "牌路":
             limit = 20 if is_vip(user) else 8
             reply_message(reply_token, f"目前牌路：\n{road_text(user['current_road'] or [], limit)}", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "分析":
-            card = append_vip_extras(prediction_card(user["current_road"] or []), user, user_id)
+            card = prediction_card(user["current_road"] or [])
+            card = append_vip_extras(card, user, user_id)
             reply_message(reply_token, card, quick_items=base_quick_reply(is_admin, user["analysis_active"]))
             continue
+
         if text == "重設":
-            user = update_user_fields(user_id, current_road=[], imported_ready=False, analysis_active=False, pending_flow=None)
+            update_user_fields(user_id, current_road=[], imported_ready=False, analysis_active=False, pending_flow=None)
             reply_message(reply_token, "已重設當前牌路與分析狀態。", quick_items=base_quick_reply(is_admin, False))
             continue
-        reply_message(reply_token, f"你剛剛說：{text}\n\n可用功能：開始 / 會員說明 / 本金配置 / 匯入牌路 / 開始分析 / 牌路 / 分析 / 綁定帳號 / 查詢資格 / 結束分析", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
+
+        reply_message(reply_token, "你剛剛說：" f"{text}\n\n" "可用功能：開始 / 會員說明 / 本金配置 / 本金10000 / 模式保守 / 紀錄+500 / 匯入牌路 / 開始分析 / 牌路 / 分析 / 綁定帳號 / 查詢資格 / 結束分析", quick_items=base_quick_reply(is_admin, user["analysis_active"]))
+
     return "OK", 200
 
 
