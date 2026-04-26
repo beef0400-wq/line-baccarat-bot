@@ -1586,6 +1586,14 @@ def callback():
             reply_message(reply_token, menu_text(user), quick_items=qr_main(is_admin))
             continue
 
+        if text == "功能介紹":
+            reply_message(
+                reply_token,
+                feature_intro_text(),
+                quick_items=qr_main(is_admin),
+            )
+            continue
+
         if text in ["會員說明", "使用教學", "開通教學"]:
             reply_message(reply_token, member_guide_text(), quick_items=qr_main(is_admin))
             continue
