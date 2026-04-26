@@ -119,6 +119,8 @@ def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS game_account TEXT UNIQUE;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_expire_at TIMESTAMP NULL;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_end_at TIMESTAMP NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP NULL;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_expired_notice_sent BOOLEAN NOT NULL DEFAULT FALSE;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_road JSONB NOT NULL DEFAULT '[]'::jsonb;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_flow TEXT NULL;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS analysis_active BOOLEAN NOT NULL DEFAULT FALSE;",
@@ -317,6 +319,8 @@ def ensure_user(line_user_id):
                 INSERT INTO users (
                     line_user_id,
                     trial_end_at,
+                    trial_started_at,
+                    trial_expired_notice_sent,
                     current_road,
                     pending_flow,
                     analysis_active,
@@ -325,12 +329,13 @@ def ensure_user(line_user_id):
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, %s::jsonb, NULL, FALSE, FALSE, %s, %s, %s)
+                VALUES (%s, %s, %s, FALSE, %s::jsonb, NULL, FALSE, FALSE, %s, %s, %s)
                 RETURNING *
                 """,
                 (
                     line_user_id,
                     now_tw() + timedelta(hours=3),
+                    now_tw(),
                     json.dumps([], ensure_ascii=False),
                     now_tw(),
                     now_tw(),
@@ -358,6 +363,8 @@ def update_user_fields(line_user_id, **fields):
                 SET game_account = %s,
                     vip_expire_at = %s,
                     trial_end_at = %s,
+                    trial_started_at = %s,
+                    trial_expired_notice_sent = %s,
                     current_road = %s::jsonb,
                     pending_flow = %s,
                     analysis_active = %s,
@@ -380,6 +387,8 @@ def update_user_fields(line_user_id, **fields):
                     fields.get("game_account", current.get("game_account")),
                     fields.get("vip_expire_at", current.get("vip_expire_at")),
                     fields.get("trial_end_at", current.get("trial_end_at")),
+                    fields.get("trial_started_at", current.get("trial_started_at")),
+                    fields.get("trial_expired_notice_sent", current.get("trial_expired_notice_sent", False)),
                     json.dumps(current_road, ensure_ascii=False),
                     fields.get("pending_flow", current.get("pending_flow")),
                     fields.get("analysis_active", current.get("analysis_active", False)),
@@ -413,6 +422,67 @@ def is_vip(user):
 
 def in_trial(user):
     return bool(user and user.get("trial_end_at") and user["trial_end_at"] > now_tw())
+
+
+def has_full_access(user):
+    return is_vip(user) or in_trial(user)
+
+
+def trial_remaining_text(user):
+    if in_trial(user):
+        mins = minutes_left(user.get("trial_end_at"))
+        hours = mins // 60
+        remain_mins = mins % 60
+        if hours > 0:
+            return f"試用剩餘：約 {hours} 小時 {remain_mins} 分鐘"
+        return f"試用剩餘：約 {remain_mins} 分鐘"
+    return "試用已結束"
+
+
+def trial_expired_text():
+    return (
+        "⏰ 試用時間已結束\n\n"
+        "剛剛的牌路分析系統已完成本局判讀\n"
+        "目前完整分析已暫停顯示\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "本局已進入關鍵結構區\n"
+        "但方向與點數配置已鎖定\n\n"
+        "👉 需開通後查看\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "如需繼續使用完整分析\n"
+        "請點選【找管理員】開通"
+    )
+
+
+def free_user_locked_text():
+    return (
+        "📊 已完成牌路解析\n\n"
+        "系統已建立本局結構判讀\n"
+        "包含：\n"
+        "▍序列比對\n"
+        "▍四路結構\n"
+        "▍穩定度分析\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "⚠️ 關鍵判讀已鎖定\n"
+        "目前為完整分析內容\n\n"
+        "👉 方向 / 狀態 / 點數配置\n"
+        "需開通後查看\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "如需繼續使用\n"
+        "請點選【找管理員】開通"
+    )
+
+
+def check_trial_transition(user):
+    if not user:
+        return user, False
+    if is_vip(user):
+        return user, False
+    ended = user.get("trial_end_at") and user["trial_end_at"] <= now_tw()
+    if ended and not user.get("trial_expired_notice_sent"):
+        user = update_user_fields(user["line_user_id"], trial_expired_notice_sent=True)
+        return user, True
+    return user, False
 
 
 def minutes_left(dt):
@@ -1316,105 +1386,114 @@ def hit_rate_summary(line_user_id):
 def get_status_text(user):
     if is_vip(user):
         days = minutes_left(user["vip_expire_at"]) // 1440
-        return f"目前狀態：VIP\n\n到期時間：{user['vip_expire_at']}\n剩餘：約 {days} 天"
+        return f"目前狀態：VIP\\n\\n到期時間：{user['vip_expire_at']}\\n剩餘：約 {days} 天"
 
     if in_trial(user):
-        mins = minutes_left(user["trial_end_at"])
-        return f"目前狀態：免費試用中\n\n剩餘時間：約 {mins} 分鐘\n試用結束後，完整分析需開通VIP。"
+        return (
+            "目前狀態：3小時免費試用中\\n\\n"
+            f"{trial_remaining_text(user)}\\n"
+            "試用期間可使用完整分析功能。"
+        )
 
-    return "試用已結束\n\nVIP開通：\n👉 註冊3A帳號 / 已有3A帳號\n👉 聯絡管理員"
-
+    return (
+        "目前狀態：免費會員\\n\\n"
+        "完整分析內容已鎖定。\\n\\n"
+        "如需使用方向判讀、詳細分析與點數配置\\n"
+        "請點選【找管理員】開通。"
+    )
 
 def open_full_access_text():
     return (
-        "🔓 開通完整功能\n\n"
-        "請先完成以下步驟：\n\n"
-        "① 註冊帳號\n"
-        "sn043.aaawin88.com\n\n"
-        "② 綁定帳號\n"
-        "點選【綁定帳號】並輸入遊戲帳號\n\n"
-        "③ 聯絡管理員\n"
-        "確認開通狀態\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
+        "👤 找管理員\\n\\n"
+        "如需開通完整功能，請先完成以下步驟：\\n\\n"
+        "① 註冊帳號\\n"
+        "sn043.aaawin88.com\\n\\n"
+        "② 綁定帳號\\n"
+        "點選【綁定帳號】並輸入遊戲帳號\\n\\n"
+        "③ 聯絡管理員\\n"
+        "確認開通狀態\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
         "開通後即可使用完整分析、點數配置與即時判讀功能。"
     )
 
-
 def feature_intro_text():
     return (
-        "📊 功能介紹\n\n"
-        "本系統提供牌路紀錄與即時分析功能。\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "▍序列比對\n"
-        "依據歷史牌路進行相似結構分析\n\n"
-        "▍四路觀察\n"
-        "大路 / 大眼仔 / 小路 / 曱甴路\n"
-        "同步查看變化與穩定度\n\n"
-        "▍數據指標\n"
-        "包含交錯率、段長、連續性等資訊\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "系統會提供：\n\n"
-        "👉 當前方向參考\n"
-        "👉 結構狀態\n"
-        "👉 風險提示\n"
-        "👉 點數配置建議\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
+        "📊 功能介紹\\n\\n"
+        "本系統提供牌路紀錄與即時分析功能。\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "▍序列比對\\n"
+        "依據歷史牌路進行相似結構分析\\n\\n"
+        "▍四路觀察\\n"
+        "大路 / 大眼仔 / 小路 / 曱甴路\\n"
+        "同步查看變化與穩定度\\n\\n"
+        "▍數據指標\\n"
+        "包含交錯率、段長、連續性等資訊\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "系統會提供：\\n\\n"
+        "👉 當前方向參考\\n"
+        "👉 結構狀態\\n"
+        "👉 風險提示\\n"
+        "👉 點數配置建議\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
         "可搭配即時紀錄使用。"
     )
 
-
 def member_guide_text():
     return (
-        "📘 使用教學\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "① 註冊帳號\n"
-        "請先完成註冊：\n"
-        "sn043.aaawin88.com\n\n"
-        "（已有帳號請跳至第二步）\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "② 綁定帳號\n"
-        "點選【綁定帳號】\n"
-        "輸入你的遊戲帳號\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "③ 找管理員開通帳號\n"
-        "完成綁定後\n"
-        "請聯絡管理員開通權限\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "④ 點數配置\n"
-        "選擇點數區間、打法模式與期望獲利\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "⑤ 匯入牌路\n"
-        "輸入目前牌路（至少15把）\n\n"
-        "例：\n"
-        "莊莊閒閒莊閒莊閒莊莊閒閒莊閒莊\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "⑥ 開始分析\n"
-        "系統進入即時模式\n"
-        "每把輸入：莊 / 閒 / 和\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "⑦ 詳細分析\n"
-        "如需查看序列匹配、四路結構、穩定度與本輪紀錄\n"
-        "請點選【詳細分析】\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "⑧ 結束分析\n"
+        "📘 使用教學\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "① 註冊帳號\\n"
+        "請先完成註冊：\\n"
+        "sn043.aaawin88.com\\n\\n"
+        "（已有帳號請跳至第二步）\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "② 綁定帳號\\n"
+        "點選【綁定帳號】\\n"
+        "輸入你的遊戲帳號\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "③ 找管理員開通帳號\\n"
+        "完成綁定後\\n"
+        "請聯絡管理員開通權限\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "④ 點數配置\\n"
+        "選擇點數區間、打法模式與期望獲利\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "⑤ 匯入牌路\\n"
+        "輸入目前牌路（至少15把）\\n\\n"
+        "例：\\n"
+        "莊莊閒閒莊閒莊閒莊莊閒閒莊閒莊\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "⑥ 開始分析\\n"
+        "系統進入即時模式\\n"
+        "每把輸入：莊 / 閒 / 和\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "⑦ 詳細分析\\n"
+        "如需查看序列匹配、四路結構、穩定度與本輪紀錄\\n"
+        "請點選【詳細分析】\\n\\n"
+        "━━━━━━━━━━━━━━━\\n\\n"
+        "⑧ 結束分析\\n"
         "輸入【結束分析】查看本輪結果"
     )
 
 def menu_text(user):
-    tag = "VIP會員" if is_vip(user) else ("免費試用中" if in_trial(user) else "免費版")
+    if is_vip(user):
+        tag = "VIP會員"
+    elif in_trial(user):
+        tag = "3小時免費試用中"
+    else:
+        tag = "免費會員"
+
     return (
-        f"歡迎使用 AI 百家方向決策輔助系統（{tag}）\n\n"
-        "建議流程：\n"
-        "1. 點數配置\n"
-        "2. 綁定帳號\n"
-        "3. 匯入牌路\n"
-        "4. 開始分析\n"
-        "5. 莊 / 閒 / 和 即時紀錄\n"
-        "6. 結束分析\n\n"
+        f"歡迎使用 AI 百家方向判讀系統（{tag}）\\n\\n"
+        "建議流程：\\n"
+        "1. 註冊帳號\\n"
+        "2. 綁定帳號\\n"
+        "3. 點數配置\\n"
+        "4. 匯入牌路\\n"
+        "5. 開始分析\\n"
+        "6. 結束分析\\n\\n"
         "請從下方按鈕開始。"
     )
-
-
 # =========================
 # Routes
 # =========================
@@ -1451,7 +1530,7 @@ def callback():
             reply_token = event.get("replyToken")
             if user_id and reply_token:
                 user = ensure_user(user_id)
-                reply_message(reply_token, menu_text(user), quick_items=qr_main(user_id in ADMIN_USER_IDS))
+                reply_message(reply_token, menu_text(user) + "\n\n🎁 已開啟3小時免費試用\n試用期間可使用完整分析功能。", quick_items=qr_main(user_id in ADMIN_USER_IDS))
             continue
 
         if event.get("type") != "message":
@@ -1470,6 +1549,7 @@ def callback():
         user = ensure_user(user_id)
         touch_user(user_id)
         user = get_user(user_id)
+        user, trial_just_expired = check_trial_transition(user)
         is_admin = user_id in ADMIN_USER_IDS
 
         # Admin commands
@@ -1576,9 +1656,13 @@ def callback():
             continue
 
         # Lock trial / VIP
-        locked_commands = ["分析", "詳細分析", "牌路", "匯入牌路", "開始分析", "莊", "閒", "和", "點數配置", "查詢配置"]
-        if not is_vip(user) and not in_trial(user) and text in locked_commands:
-            reply_message(reply_token, get_status_text(user), quick_items=qr_main(is_admin))
+        full_access_commands = ["分析", "詳細分析", "開始分析", "莊", "閒", "和", "點數配置", "查詢配置"]
+        if trial_just_expired and text in full_access_commands:
+            reply_message(reply_token, trial_expired_text(), quick_items=qr_main(is_admin))
+            continue
+
+        if not has_full_access(user) and text in full_access_commands:
+            reply_message(reply_token, free_user_locked_text(), quick_items=qr_main(is_admin))
             continue
 
         # General
@@ -1603,7 +1687,7 @@ def callback():
             reply_message(reply_token, "請輸入你的遊戲帳號\n例如：ck76888", quick_items=qr_main(is_admin))
             continue
 
-        if text in ["開通", "VIP", "開通完整功能", "找管理員"]:
+        if text in ["找管理員", "開通", "VIP", "開通完整功能"]:
             reply_message(
                 reply_token,
                 open_full_access_text(),
