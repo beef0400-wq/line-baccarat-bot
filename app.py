@@ -1,22 +1,22 @@
+
 # =========================
-# V11 完整版（可上線）
+# V11 FINAL 商業完整版（穩定可上線）
 # =========================
-# (已為你整理完整版本，直接貼上即可用)
 from flask import Flask, request, abort
-import os, json, re, math
+import os, json, re
 from datetime import datetime, timedelta, timezone
 import hmac, hashlib, base64
 import requests
 
 app = Flask(__name__)
 
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "").strip()
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
+CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN","")
+CHANNEL_SECRET = os.getenv("CHANNEL_SECRET","")
 
-LINE_REPLY_API = "https://api.line.me/v2/bot/message/reply"
+LINE_API = "https://api.line.me/v2/bot/message/reply"
 HEADERS = {
     "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-    "Content-Type": "application/json"
+    "Content-Type":"application/json"
 }
 
 TZ = timezone(timedelta(hours=8))
@@ -25,49 +25,50 @@ def now():
 
 users = {}
 
-def default_user():
-    return {
-        "vip": False,
-        "vip_expire": None,
-        "trial_end": now() + timedelta(hours=3),
-        "trial_notice_sent": False,
-        "road": [],
-        "streak": 0,
-        "last_result": None,
-        "hl": {"high": 0, "low": 0}
-    }
-
 def get_user(uid):
     if uid not in users:
-        users[uid] = default_user()
+        users[uid] = {
+            "vip": False,
+            "vip_expire": None,
+            "trial_end": now()+timedelta(hours=3),
+            "trial_notice": False,
+            "road": [],
+            "hl": {"high":0,"low":0}
+        }
     return users[uid]
 
-def in_trial(u):
-    return now() < u["trial_end"]
-
 def is_vip(u):
-    return u["vip"] and u["vip_expire"] and now() < u["vip_expire"]
+    return u["vip"] and u["vip_expire"] and now()<u["vip_expire"]
+
+def in_trial(u):
+    return now()<u["trial_end"]
 
 def has_access(u):
     return is_vip(u) or in_trial(u)
 
-def reply(token, text):
-    requests.post(LINE_REPLY_API, headers=HEADERS, json={
-        "replyToken": token,
+def reply(token,text):
+    requests.post(LINE_API,headers=HEADERS,json={
+        "replyToken":token,
         "messages":[{"type":"text","text":text}]
     })
 
-def analyze(road):
-    if len(road) < 15:
+# =========================
+# 分析引擎 V11
+# =========================
+
+def analyze(u):
+    road = u["road"]
+    if len(road)<15:
         return None
 
     z = road.count("莊")
     x = road.count("閒")
-    total = max(1, z+x)
+    total = max(1,z+x)
 
     score_z = z/total
     score_x = x/total
 
+    # 長龍
     streak = 1
     for i in range(len(road)-1,0,-1):
         if road[i]==road[i-1]:
@@ -100,8 +101,8 @@ def analyze(road):
         state="🔥 強攻"
         coef=1.6
     elif diff>0.1:
-        state="✅ 可啟動"
-        coef=1.2
+        state="✅ 進攻"
+        coef=1.3
     elif diff>0.06:
         state="👀 觀察"
         coef=0.8
@@ -109,31 +110,85 @@ def analyze(road):
         state="⚠️ 保守"
         coef=0.5
 
-    base=100
-    bet=int(base*coef)
+    # 高低牌
+    high=u["hl"]["high"]
+    low=u["hl"]["low"]
+    total_hl=max(1,high+low)
 
-    return d,pct,state,bet,streak
+    if high/total_hl>0.55:
+        hl_coef=1.15
+        hl_text="高牌偏多"
+    elif low/total_hl>0.55:
+        hl_coef=0.85
+        hl_text="低牌偏多"
+    else:
+        hl_coef=1.0
+        hl_text="均衡"
 
-@app.route("/", methods=["POST"])
+    bet=int(100*coef*hl_coef)
+
+    return d,pct,state,bet,streak,hl_text
+
+# =========================
+# webhook
+# =========================
+
+@app.route("/",methods=["POST"])
 def webhook():
     body=request.json
+
     for e in body["events"]:
+        if e["type"]=="follow":
+            uid=e["source"]["userId"]
+            get_user(uid)
+            reply(e["replyToken"],
+                "🎁 已開啟3小時試用\n請輸入牌路開始分析")
+            continue
+
         if e["type"]!="message":
             continue
 
         uid=e["source"]["userId"]
         text=e["message"]["text"]
-
         u=get_user(uid)
 
-        if not has_access(u) and text=="開始分析":
-            reply(e["replyToken"],"試用已結束，請找管理員開通")
+        # 試用結束提示
+        if not in_trial(u) and not is_vip(u) and not u["trial_notice"]:
+            u["trial_notice"]=True
+            reply(e["replyToken"],
+                "⏰ 試用已結束\n👉 請找管理員開通")
             continue
 
         if text=="開始":
             reply(e["replyToken"],"請輸入牌路")
             continue
 
+        if text=="功能介紹":
+            reply(e["replyToken"],
+                "V11系統：多模型+長龍控制+點數策略")
+            continue
+
+        if text=="會員說明":
+            reply(e["replyToken"],
+                "流程：註冊→綁定→找管理員")
+            continue
+
+        if text in ["找管理員","開通"]:
+            reply(e["replyToken"],"請聯絡管理員")
+            continue
+
+        # 高低牌
+        if text=="高":
+            u["hl"]["high"]+=1
+            reply(e["replyToken"],"已記錄高牌")
+            continue
+
+        if text=="低":
+            u["hl"]["low"]+=1
+            reply(e["replyToken"],"已記錄低牌")
+            continue
+
+        # 牌路
         if "莊" in text or "閒" in text:
             for c in text:
                 if c in ["莊","閒"]:
@@ -142,13 +197,30 @@ def webhook():
             continue
 
         if text=="開始分析":
-            res=analyze(u["road"])
+            if not has_access(u):
+                reply(e["replyToken"],
+                    "📊 分析已鎖\n請找管理員開通")
+                continue
+
+            res=analyze(u)
             if not res:
                 reply(e["replyToken"],"請至少15把")
                 continue
 
-            d,pct,state,bet,streak=res
-            reply(e["replyToken"],f"{d} {pct}%\n{state}\n點數:{bet}")
+            d,pct,state,bet,streak,hl=res
+
+            reply(e["replyToken"],
+                f"🎯 {d} {pct}%\n"
+                f"{state}\n"
+                f"連續:{streak}\n"
+                f"牌值:{hl}\n"
+                f"💰點數:{bet}")
+            continue
+
+        if text=="結束分析":
+            u["road"]=[]
+            u["hl"]={"high":0,"low":0}
+            reply(e["replyToken"],"已結束")
             continue
 
     return "OK"
