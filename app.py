@@ -36,6 +36,8 @@ except Exception:
     psycopg2 = None
 
 app = Flask(__name__)
+VERSION_MARKER = "V13_SAFE_LOGS"
+print("🔥 LOADED", VERSION_MARKER, flush=True)
 VERSION_MARKER = "V13_DB_FIXED_HL_BUTTONS"
 print("🔥 LOADED", VERSION_MARKER, flush=True)
 
@@ -234,15 +236,21 @@ def init_db():
             for name, typ in log_cols:
                 cur.execute(f"ALTER TABLE analysis_logs ADD COLUMN IF NOT EXISTS {name} {typ};")
 
-            # legacy analysis_logs safety: older versions may have NOT NULL columns not used by V13
+            # LEGACY_LOG_COLUMNS_DYNAMIC_FIX
+            # 舊版 analysis_logs 可能殘留 NOT NULL 欄位；只處理存在的欄位
+            cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name='analysis_logs'
+            """)
+            existing_log_cols = [r["column_name"] for r in cur.fetchall()]
             for col in ["banker_pct", "player_pct", "confidence", "risk_score", "point_low", "point_high"]:
-                try:
-                    cur.execute(f"ALTER TABLE analysis_logs ALTER COLUMN {col} DROP NOT NULL;")
-                    cur.execute(f"ALTER TABLE analysis_logs ALTER COLUMN {col} SET DEFAULT 0;")
-                except Exception as e:
-                    print("SKIP_LEGACY_LOG_COL:", col, repr(e), flush=True)
-                    conn.rollback()
-                    cur = conn.cursor()
+                if col in existing_log_cols:
+                    try:
+                        cur.execute(f"ALTER TABLE analysis_logs ALTER COLUMN {col} DROP NOT NULL;")
+                        cur.execute(f"ALTER TABLE analysis_logs ALTER COLUMN {col} SET DEFAULT 0;")
+                    except Exception as e:
+                        print("SKIP_LEGACY_LOG_COL:", col, repr(e), flush=True)
 
             # migration safety
             cols = [
@@ -400,16 +408,98 @@ def find_user_by_account(account):
     return None
 
 def add_log(line_user_id, predicted, actual, hit):
+    """
+    安全寫入分析紀錄。
+    舊版 DB 可能殘留 banker_pct / player_pct 等 NOT NULL 欄位。
+    這裡會動態讀取 analysis_logs 實際欄位，能填的都填。
+    即使 DB 紀錄失敗，也不讓 LINE 回覆中斷。
+    """
     if use_db():
-        with db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                INSERT INTO analysis_logs (line_user_id, predicted, actual, hit, created_at)
-                VALUES (%s,%s,%s,%s,%s)
-                """, (line_user_id, predicted, actual, hit, now_tw().replace(tzinfo=None)))
-            conn.commit()
-    else:
-        MEMORY_LOGS.append({"line_user_id": line_user_id, "predicted": predicted, "actual": actual, "hit": hit, "created_at": now_tw()})
+        try:
+            with db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS analysis_logs (
+                        id SERIAL PRIMARY KEY,
+                        line_user_id TEXT,
+                        predicted TEXT,
+                        actual TEXT,
+                        hit BOOLEAN,
+                        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                    );
+                    """)
+
+                    cur.execute("""
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_name = 'analysis_logs'
+                    ORDER BY ordinal_position
+                    """)
+                    columns_info = cur.fetchall()
+
+                    known_values = {
+                        "line_user_id": line_user_id,
+                        "predicted": predicted,
+                        "actual": actual,
+                        "hit": hit,
+                        "created_at": now_tw().replace(tzinfo=None),
+
+                        # 舊版殘留欄位安全預設值
+                        "banker_pct": 0,
+                        "player_pct": 0,
+                        "confidence": 0,
+                        "risk_score": 0,
+                        "point_low": 0,
+                        "point_high": 0,
+                    }
+
+                    cols = []
+                    vals = []
+
+                    for info in columns_info:
+                        col = info["column_name"]
+                        dtype = (info.get("data_type") or "").lower()
+                        nullable = info.get("is_nullable")
+                        default = info.get("column_default")
+
+                        if col == "id":
+                            continue
+
+                        if col in known_values:
+                            cols.append(col)
+                            vals.append(known_values[col])
+                            continue
+
+                        # 舊欄位若 NOT NULL 且無預設，補安全值
+                        if nullable == "NO" and default is None:
+                            cols.append(col)
+                            if any(x in dtype for x in ["int", "numeric", "double", "real", "decimal"]):
+                                vals.append(0)
+                            elif "bool" in dtype:
+                                vals.append(False)
+                            elif "timestamp" in dtype or "date" in dtype:
+                                vals.append(now_tw().replace(tzinfo=None))
+                            else:
+                                vals.append("")
+
+                    if cols:
+                        placeholders = ", ".join(["%s"] * len(cols))
+                        cur.execute(
+                            f"INSERT INTO analysis_logs ({', '.join(cols)}) VALUES ({placeholders})",
+                            vals
+                        )
+                conn.commit()
+        except Exception as e:
+            print("ADD_LOG_SKIPPED:", repr(e), flush=True)
+        return
+
+    MEMORY_LOGS.append({
+        "line_user_id": line_user_id,
+        "predicted": predicted,
+        "actual": actual,
+        "hit": hit,
+        "created_at": now_tw()
+    })
 
 def recent_hit_rate(line_user_id, limit=30):
     if use_db():
