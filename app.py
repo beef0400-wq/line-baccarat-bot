@@ -36,6 +36,8 @@ except Exception:
     psycopg2 = None
 
 app = Flask(__name__)
+VERSION_MARKER = "V13_DB_FIXED_HL_BUTTONS"
+print("🔥 LOADED", VERSION_MARKER, flush=True)
 
 # =========================
 # ENV
@@ -221,6 +223,17 @@ def init_db():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
             """)
+            # analysis_logs migration safety
+            log_cols = [
+                ("line_user_id", "TEXT"),
+                ("predicted", "TEXT"),
+                ("actual", "TEXT"),
+                ("hit", "BOOLEAN"),
+                ("created_at", "TIMESTAMP NOT NULL DEFAULT NOW()"),
+            ]
+            for name, typ in log_cols:
+                cur.execute(f"ALTER TABLE analysis_logs ADD COLUMN IF NOT EXISTS {name} {typ};")
+
             # migration safety
             cols = [
                 ("bound_account", "TEXT"),
@@ -501,11 +514,11 @@ def qr_targets():
 
 def qr_analysis():
     return [
-        ("莊", "莊"),
-        ("閒", "閒"),
+        ("莊-高", "莊-高"),
+        ("莊-低", "莊-低"),
+        ("閒-高", "閒-高"),
+        ("閒-低", "閒-低"),
         ("和", "和"),
-        ("高牌", "高"),
-        ("低牌", "低"),
         ("詳細分析", "詳細分析"),
         ("結束分析", "結束分析"),
     ]
@@ -528,7 +541,7 @@ def feature_intro_text():
         "▍點數配置\n"
         "依點數區間、打法模式、期望獲利與風險係數動態調整\n\n"
         "▍高低牌權重（選用）\n"
-        "可輸入高 / 低，輔助判斷牌值結構與波動\n\n"
+        "可用莊-高 / 莊-低 / 閒-高 / 閒-低快速記錄牌值結構\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "系統會提供：\n"
         "👉 當前方向參考\n"
@@ -564,11 +577,11 @@ def member_guide_text():
         "輸入【開始分析】進入即時模式\n"
         "每把輸入：莊 / 閒 / 和\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "⑦ 高低牌（選用）\n"
-        "可直接輸入：高 / 低\n"
-        "或輸入：莊 高、閒 低\n\n"
+        "⑦ 高低牌（VIP即時按鍵）\n"
+        "即時分析時請優先點選：\n"
+        "莊-高 / 莊-低 / 閒-高 / 閒-低 / 和\n\n"
         "說明：0～5 視為低牌；6～9 視為高牌\n"
-        "不輸入也能正常分析\n\n"
+        "若不確定高低，也可只輸入：莊 / 閒 / 和\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "⑧ 詳細分析\n"
         "查看序列、四路、穩定度、點數與本輪紀錄\n\n"
@@ -1029,7 +1042,7 @@ def decision_card(user, analysis):
         f"⚠️ 風險：{analysis['risk']}\n"
         f"📌 建議模式：{user.get('play_mode') or '尚未設定'}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "操作：莊 / 閒 / 和 / 高 / 低 / 詳細分析 / 結束分析"
+        "操作：莊-高 / 莊-低 / 閒-高 / 閒-低 / 和 / 詳細分析 / 結束分析"
     )
 
 def detail_card(user, analysis):
@@ -1378,8 +1391,8 @@ def callback():
             continue
 
         # High/low only
-        if text in ["高", "低"]:
-            if text == "高":
+        if text in ["高", "低", "高牌", "低牌"]:
+            if text in ["高", "高牌"]:
                 user = update_user(line_user_id, high_count=(user.get("high_count", 0) or 0) + 1)
                 reply_text(reply_token, "已記錄：高牌", quick_items=qr_analysis())
             else:
