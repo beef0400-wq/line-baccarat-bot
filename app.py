@@ -433,12 +433,18 @@ def check_trial_transition(user):
 # =========================
 def verify_signature(req):
     if not CHANNEL_SECRET:
+        print("CHANNEL_SECRET_NOT_SET_SKIP_VERIFY")
         return True
+
     signature = req.headers.get("X-Line-Signature", "")
     body = req.get_data(as_text=True)
     digest = hmac.new(CHANNEL_SECRET.encode(), body.encode(), hashlib.sha256).digest()
     expected = base64.b64encode(digest).decode()
-    return hmac.compare_digest(signature, expected)
+    ok = hmac.compare_digest(signature, expected)
+    if not ok:
+        print("SIGNATURE_VERIFY_FAILED")
+    return ok
+
 
 def quick_reply(items):
     return {
@@ -450,15 +456,23 @@ def quick_reply(items):
 
 def reply_text(reply_token, text, quick_items=None):
     if not reply_token:
+        print("NO_REPLY_TOKEN")
         return
+
+    if not CHANNEL_ACCESS_TOKEN:
+        print("MISSING_CHANNEL_ACCESS_TOKEN")
+        return
+
     payload = {
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:4900]}]
+        "messages": [{"type": "text", "text": str(text)[:4900]}]
     }
+
     if quick_items:
         payload["messages"][0]["quickReply"] = quick_reply(quick_items)
+
     try:
-        requests.post(
+        r = requests.post(
             "https://api.line.me/v2/bot/message/reply",
             headers={
                 "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
@@ -467,8 +481,11 @@ def reply_text(reply_token, text, quick_items=None):
             json=payload,
             timeout=8
         )
+        print("LINE_REPLY_STATUS:", r.status_code)
+        print("LINE_REPLY_BODY:", r.text[:500])
     except Exception as e:
-        print("LINE reply error:", e)
+        print("LINE_REPLY_ERROR:", repr(e))
+
 
 def qr_main(is_admin=False):
     items = [
@@ -1126,14 +1143,28 @@ def settlement_card(user):
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "OK - LINE Bot is running"
+    return "OK - LINE Bot is running / token_set=" + str(bool(CHANNEL_ACCESS_TOKEN))
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {
+        "ok": True,
+        "time": dt_to_str(now_tw()),
+        "token_set": bool(CHANNEL_ACCESS_TOKEN),
+        "secret_set": bool(CHANNEL_SECRET),
+        "db": use_db()
+    }
 
 @app.route("/callback", methods=["POST"])
 def callback():
+    print("CALLBACK_HIT")
+
     if not verify_signature(request):
         abort(400)
 
     data = request.get_json(silent=True) or {}
+    print("CALLBACK_BODY:", json.dumps(data, ensure_ascii=False)[:1000])
     events = data.get("events", [])
 
     for event in events:
@@ -1166,6 +1197,7 @@ def callback():
             continue
 
         text = msg.get("text", "").strip()
+        print("USER_TEXT:", line_user_id, repr(text))
         user, trial_just_expired = check_trial_transition(user)
 
         # Admin
