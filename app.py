@@ -234,6 +234,16 @@ def init_db():
             for name, typ in log_cols:
                 cur.execute(f"ALTER TABLE analysis_logs ADD COLUMN IF NOT EXISTS {name} {typ};")
 
+            # legacy analysis_logs safety: older versions may have NOT NULL columns not used by V13
+            for col in ["banker_pct", "player_pct", "confidence", "risk_score", "point_low", "point_high"]:
+                try:
+                    cur.execute(f"ALTER TABLE analysis_logs ALTER COLUMN {col} DROP NOT NULL;")
+                    cur.execute(f"ALTER TABLE analysis_logs ALTER COLUMN {col} SET DEFAULT 0;")
+                except Exception as e:
+                    print("SKIP_LEGACY_LOG_COL:", col, repr(e), flush=True)
+                    conn.rollback()
+                    cur = conn.cursor()
+
             # migration safety
             cols = [
                 ("bound_account", "TEXT"),
