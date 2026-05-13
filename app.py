@@ -36,7 +36,7 @@ except Exception:
     psycopg2 = None
 
 app = Flask(__name__)
-VERSION_MARKER = "V13_SAFE_LOGS_ADMIN_LINK"
+VERSION_MARKER = "V13_ADMIN_LINK_NEWLINE_FIXED"
 print("🔥 LOADED", VERSION_MARKER, flush=True)
 VERSION_MARKER = "V13_DB_FIXED_HL_BUTTONS"
 print("🔥 LOADED", VERSION_MARKER, flush=True)
@@ -692,21 +692,21 @@ def member_guide_text():
 
 def open_full_access_text():
     return (
-        "👤 找管理員\\n\\n"
-        "如需開通完整功能，請先完成：\\n\\n"
-        "① 註冊帳號\\n"
-        "sn043.aaawin88.com\\n\\n"
-        "② 綁定帳號\\n"
-        "點選【綁定帳號】或輸入：綁定 你的帳號\\n\\n"
-        "③ 聯繫管理員\\n"
-        "請點以下連結直接聯繫：\\n"
-        "https://line.me/R/ti/p/@163brkzi\\n\\n"
-        "或直接傳：我要開通完整功能\\n\\n"
-        "━━━━━━━━━━━━━━━\\n\\n"
-        "開通後即可使用：\\n"
-        "✔ 即時分析\\n"
-        "✔ 點數配置\\n"
-        "✔ 詳細分析\\n"
+        "👤 找管理員\n\n"
+        "如需開通完整功能，請先完成：\n\n"
+        "① 註冊帳號\n"
+        "sn043.aaawin88.com\n\n"
+        "② 綁定帳號\n"
+        "點選【綁定帳號】或輸入：綁定 你的帳號\n\n"
+        "③ 聯繫管理員\n"
+        "請點以下連結直接聯繫：\n"
+        "https://line.me/R/ti/p/@163brkzi\n\n"
+        "或直接傳：我要開通完整功能\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "開通後即可使用：\n"
+        "✔ 即時分析\n"
+        "✔ 點數配置\n"
+        "✔ 詳細分析\n"
         "✔ 本輪結算"
     )
 
