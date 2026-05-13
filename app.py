@@ -36,9 +36,9 @@ except Exception:
     psycopg2 = None
 
 app = Flask(__name__)
-VERSION_MARKER = "V13_ADMIN_LINK_NEWLINE_FIXED"
+VERSION_MARKER = "V13_ADMIN_LINK_CLEAN"
 print("🔥 LOADED", VERSION_MARKER, flush=True)
-VERSION_MARKER = "V13_DB_FIXED_HL_BUTTONS"
+VERSION_MARKER = "V13_ADMIN_LINK_CLEAN"
 print("🔥 LOADED", VERSION_MARKER, flush=True)
 
 # =========================
@@ -701,7 +701,7 @@ def open_full_access_text():
         "③ 聯繫管理員\n"
         "請點以下連結直接聯繫：\n"
         "https://line.me/R/ti/p/@163brkzi\n\n"
-        "或直接傳：我要開通完整功能\n\n"
+        ""
         "━━━━━━━━━━━━━━━\n\n"
         "開通後即可使用：\n"
         "✔ 即時分析\n"
