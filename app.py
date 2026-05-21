@@ -648,6 +648,15 @@ def qr_pair_confirm():
         ("結束分析", "結束分析"),
     ]
 
+def qr_value_confirm():
+    return [
+        ("高牌", "高牌"),
+        ("低牌", "低牌"),
+        ("跳過牌值", "跳過牌值"),
+        ("詳細分析", "詳細分析"),
+        ("結束分析", "結束分析"),
+    ]
+
 def qr_after_analysis():
     return [
         ("莊", "莊"),
@@ -795,6 +804,13 @@ def pair_confirm_text(main_result):
         f"已記錄主結果：{main_result}\n\n"
         "本把是否有對子？\n\n"
         "請選擇：無對子 / 莊對 / 閒對 / 雙對"
+    )
+
+def value_confirm_text(pair_text):
+    return (
+        f"已確認對子：{pair_summary(pair_text)}\n\n"
+        "本把牌值偏向？\n\n"
+        "請選擇：高牌 / 低牌 / 跳過牌值"
     )
 
 # =========================
@@ -1485,6 +1501,17 @@ def apply_pair_result(user, line_user_id, pair_text):
         line_user_id,
         banker_pair_count=(user.get("banker_pair_count", 0) or 0) + bp,
         player_pair_count=(user.get("player_pair_count", 0) or 0) + pp,
+        pending_flow="value_confirm",
+    )
+
+def apply_value_result(user, line_user_id, value_text):
+    high_add = 1 if value_text == "高牌" else 0
+    low_add = 1 if value_text == "低牌" else 0
+
+    return update_user(
+        line_user_id,
+        high_count=(user.get("high_count", 0) or 0) + high_add,
+        low_count=(user.get("low_count", 0) or 0) + low_add,
         pending_flow=None,
         pending_main_result=None,
     )
@@ -1696,7 +1723,7 @@ def callback():
         # Access lock
         full_access_commands = [
             "匯入牌路", "開始分析", "詳細分析", "莊", "閒", "和",
-            "無對子", "莊對", "閒對", "雙對"
+            "無對子", "莊對", "閒對", "雙對", "高牌", "低牌", "跳過牌值"
         ]
         if trial_just_expired and text in full_access_commands:
             reply_text(reply_token, trial_expired_text(), quick_items=qr_main(is_admin))
@@ -1815,12 +1842,20 @@ def callback():
         # Pair confirmation flow
         if user.get("pending_flow") == "pair_confirm" and text in ["無對子", "莊對", "閒對", "雙對"]:
             user = apply_pair_result(user, line_user_id, text)
+            reply_text(reply_token, value_confirm_text(text), quick_items=qr_value_confirm())
+            continue
+
+        # Value confirmation flow
+        if user.get("pending_flow") == "value_confirm" and text in ["高牌", "低牌", "跳過牌值"]:
+            user = apply_value_result(user, line_user_id, text)
             user = get_user(line_user_id) or user
+
+            value_label = "不記牌值" if text == "跳過牌值" else text
 
             if len(main_only(user.get("current_road", []))) < MIN_ROAD_LEN:
                 reply_text(
                     reply_token,
-                    f"已確認：{pair_summary(text)}\n\n"
+                    f"已確認牌值：{value_label}\n\n"
                     f"目前莊閒主路{len(main_only(user.get('current_road', [])))}把，滿{MIN_ROAD_LEN}把後可開始分析。",
                     quick_items=qr_main_result()
                 )
@@ -1837,7 +1872,7 @@ def callback():
             user = update_user(line_user_id, last_prediction=analysis["direction"])
             reply_text(
                 reply_token,
-                f"已確認：{pair_summary(text)}\n\n" + decision_card(user, analysis),
+                f"已確認牌值：{value_label}\n\n" + decision_card(user, analysis),
                 quick_items=qr_after_analysis()
             )
             continue
@@ -1878,7 +1913,30 @@ def callback():
             reply_text(reply_token, summary + "\n\n你可以重新匯入牌路，或調整點數配置。", quick_items=qr_main(is_admin))
             continue
 
-        # Main result during analysis
+        # Main result during analysis, supports direct value input like 莊-高 / 閒-低
+        if text in ["莊-高", "莊-低", "閒-高", "閒-低"]:
+            if not user.get("analysis_active") and len(main_only(user.get("current_road", []))) < MIN_ROAD_LEN:
+                reply_text(reply_token, "請先匯入牌路並點選【開始分析】。", quick_items=qr_main(is_admin))
+                continue
+
+            main_result = "莊" if text.startswith("莊") else "閒"
+            user = record_main_result(user, line_user_id, main_result)
+
+            high_add = 1 if "高" in text else 0
+            low_add = 1 if "低" in text else 0
+            user = update_user(
+                line_user_id,
+                high_count=(user.get("high_count", 0) or 0) + high_add,
+                low_count=(user.get("low_count", 0) or 0) + low_add,
+            )
+
+            reply_text(
+                reply_token,
+                f"已記錄主結果：{main_result}\n已記錄牌值：{'高牌' if high_add else '低牌'}\n\n本把是否有對子？",
+                quick_items=qr_pair_confirm()
+            )
+            continue
+
         if text in ["莊", "閒", "和"]:
             if not user.get("analysis_active") and len(main_only(user.get("current_road", []))) < MIN_ROAD_LEN:
                 reply_text(reply_token, "請先匯入牌路並點選【開始分析】。", quick_items=qr_main(is_admin))
@@ -1888,8 +1946,8 @@ def callback():
             reply_text(reply_token, pair_confirm_text(text), quick_items=qr_pair_confirm())
             continue
 
-        # Support old high / low quick notes
-        if text in ["高", "低", "高牌", "低牌", "莊-高", "莊-低", "閒-高", "閒-低"]:
+        # Standalone high / low note, only for補記
+        if text in ["高", "低", "高牌", "低牌"]:
             high_add = 1 if "高" in text else 0
             low_add = 1 if "低" in text else 0
             user = update_user(
@@ -1897,7 +1955,7 @@ def callback():
                 high_count=(user.get("high_count", 0) or 0) + high_add,
                 low_count=(user.get("low_count", 0) or 0) + low_add,
             )
-            reply_text(reply_token, f"已記錄牌值：{'高' if high_add else '低'}", quick_items=qr_main_result())
+            reply_text(reply_token, f"已補記牌值：{'高牌' if high_add else '低牌'}", quick_items=qr_main_result())
             continue
 
         # fallback
