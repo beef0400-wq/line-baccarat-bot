@@ -1655,41 +1655,33 @@ def callback():
                 continue
 
             if text == "完成匯入":
-    main_count = len(main_only(road))
-
-    if main_count < MIN_ROAD_LEN:
-        reply_text(
-            reply_token,
-            f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。\n"
-            "和局會記錄，但不計入莊閒主路把數。",
-            quick_items=qr_import_road()
-        )
-        continue
-
-    user = update_user(
-        line_user_id,
-        imported_ready=True,
-        analysis_active=False,
-        pending_flow=None
-    )
-
-    reply_text(
-        reply_token,
-        "✅ 匯入完成\n\n"
-        f"主路：{road_to_text(user.get('current_road', []), 40)}\n\n"
-        f"莊閒主路：{main_count}把\n"
-        f"和局：{user.get('tie_count', 0) or 0}\n"
-        f"莊對：{user.get('banker_pair_count', 0) or 0}\n"
-        f"閒對：{user.get('player_pair_count', 0) or 0}\n\n"
-        "請點選【開始分析】。",
-        quick_items=[
-            ("開始分析", "開始分析"),
-            ("點數配置", "點數配置")
-        ]
-    )
-
-    continue
-
+                main_count = len(main_only(road))
+                if main_count < MIN_ROAD_LEN:
+                    reply_text(
+                        reply_token,
+                        f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。\n"
+                        "和局會記錄，但不計入莊閒主路把數。",
+                        quick_items=qr_import_road()
+                    )
+                    continue
+                user = update_user(
+                    line_user_id,
+                    imported_ready=True,
+                    analysis_active=False,
+                    pending_flow=None
+                )
+                reply_text(
+                    reply_token,
+                    "✅ 匯入完成\n\n"
+                    f"主路：{road_to_text(user.get('current_road', []), 40)}\n\n"
+                    f"莊閒主路：{main_count}把\n"
+                    f"和局：{user.get('tie_count', 0) or 0}\n"
+                    f"莊對：{user.get('banker_pair_count', 0) or 0}\n"
+                    f"閒對：{user.get('player_pair_count', 0) or 0}\n\n"
+                    "請點選【開始分析】。",
+                    quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")]
+                )
+                continue
             if text == "匯入莊":
                 road.append("莊")
                 user = update_user(line_user_id, current_road=road)
@@ -1722,8 +1714,11 @@ def callback():
             results = extract_results(text)
             main = [x for x in results if x in ["莊", "閒"]]
             if len(main) < MIN_ROAD_LEN:
-                reply_text(reply_token, f"目前只有{len(main)}把莊閒主路，請至少輸入{MIN_ROAD_LEN}把。
-建議改用【匯入牌路】按鈕模式，避免莊對/閒對被誤判。")
+                reply_text(
+                    reply_token,
+                    f"目前只有{len(main)}把莊閒主路，請至少輸入{MIN_ROAD_LEN}把。\n"
+                    "建議改用【匯入牌路】按鈕模式，避免莊對/閒對被誤判。"
+                )
                 continue
             user = update_user(
                 line_user_id,
@@ -1744,16 +1739,23 @@ def callback():
                 banker_pair_count=0,
                 player_pair_count=0,
             )
-            reply_text(reply_token, f"已匯入牌路：莊閒主路{len(main)}把 / 和局{sum(1 for x in results if x == '和')}把
-請點選【開始分析】。", quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")])
+            reply_text(
+                reply_token,
+                f"已匯入牌路：莊閒主路{len(main)}把 / 和局{sum(1 for x in results if x == '和')}把\n"
+                "請點選【開始分析】。",
+                quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")]
+            )
             continue
-
         if text == "開始分析":
             road = user.get("current_road", [])
             if len(main_only(road)) < MIN_ROAD_LEN:
                 user = update_user(line_user_id, pending_flow="import_buttons")
-                reply_text(reply_token, f"請先匯入至少{MIN_ROAD_LEN}把莊閒主路。
-和局可記錄，但不計入主路把數。", quick_items=qr_import_road())
+                reply_text(
+                    reply_token,
+                    f"請先匯入至少{MIN_ROAD_LEN}把莊閒主路。\n"
+                    "和局可記錄，但不計入主路把數。",
+                    quick_items=qr_import_road()
+                )
                 continue
             user = update_user(line_user_id, analysis_active=True)
             analysis = analyze_v13(user)
