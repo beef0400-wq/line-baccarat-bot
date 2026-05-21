@@ -631,35 +631,22 @@ def import_status_text(user, last_note=""):
     banker_pair_count = user.get("banker_pair_count", 0) or 0
     player_pair_count = user.get("player_pair_count", 0) or 0
 
-    note = f"已記錄：{last_note}
+    note = ""
+    if last_note:
+        note = f"已記錄：{last_note}\n\n"
 
-" if last_note else ""
     recent = road_to_text(road, 30) or "尚未輸入"
 
     return (
-        f"{note}📥 按鈕匯入牌路中
-
-"
-        f"主路進度：{main_count} / {MIN_ROAD_LEN}
-"
-        f"和局：{tie_count}
-"
-        f"莊對：{banker_pair_count}
-"
-        f"閒對：{player_pair_count}
-
-"
-        "━━━━━━━━━━━━━━━
-
-"
-        f"最近牌路：
-{recent}
-
-"
-        "操作方式：
-"
-        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】
-"
+        f"{note}📥 按鈕匯入牌路中\n\n"
+        f"主路進度：{main_count} / {MIN_ROAD_LEN}\n"
+        f"和局：{tie_count}\n"
+        f"莊對：{banker_pair_count}\n"
+        f"閒對：{player_pair_count}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"最近牌路：\n{recent}\n\n"
+        "操作方式：\n"
+        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】\n"
         "滿15把莊閒主路後，按【完成匯入】。"
     )
 
