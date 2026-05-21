@@ -633,20 +633,36 @@ def import_status_text(user, last_note=""):
 
     note = ""
     if last_note:
-        note = f"已記錄：{last_note}\n\n"
+        note = f"已記錄：{last_note}
+
+"
 
     recent = road_to_text(road, 30) or "尚未輸入"
 
     return (
-        f"{note}📥 按鈕匯入牌路中\n\n"
-        f"主路進度：{main_count} / {MIN_ROAD_LEN}\n"
-        f"和局：{tie_count}\n"
-        f"莊對：{banker_pair_count}\n"
-        f"閒對：{player_pair_count}\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"最近牌路：\n{recent}\n\n"
-        "操作方式：\n"
-        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】\n"
+        f"{note}📥 按鈕匯入牌路中
+
+"
+        f"主路進度：{main_count} / {MIN_ROAD_LEN}
+"
+        f"和局：{tie_count}
+"
+        f"莊對：{banker_pair_count}
+"
+        f"閒對：{player_pair_count}
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        f"最近牌路：
+{recent}
+
+"
+        "操作方式：
+"
+        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】
+"
         "滿15把莊閒主路後，按【完成匯入】。"
     )
 
@@ -1658,8 +1674,13 @@ def callback():
             if text == "完成匯入":
                 main_count = len(main_only(road))
                 if main_count < MIN_ROAD_LEN:
-                    reply_text(reply_token, f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。
-和局會記錄，但不計入莊閒主路把數。", quick_items=qr_import_road())
+                    reply_text(
+                        reply_token,
+                        f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。
+"
+                        "和局會記錄，但不計入莊閒主路把數。",
+                        quick_items=qr_import_road()
+                    )
                     continue
                 user = update_user(line_user_id, imported_ready=True, analysis_active=False, pending_flow=None)
                 reply_text(
