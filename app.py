@@ -1655,29 +1655,40 @@ def callback():
                 continue
 
             if text == "完成匯入":
-                main_count = len(main_only(road))
-                if main_count < MIN_ROAD_LEN:
-                    reply_text(
-                        reply_token,
-                        f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。\n"
-"
-                        "和局會記錄，但不計入莊閒主路把數。",
-                        quick_items=qr_import_road()
-                    )
-                    continue
-                user = update_user(line_user_id, imported_ready=True, analysis_active=False, pending_flow=None)
-                reply_text(
-                    reply_token,
-                    "✅ 匯入完成\n\n"
-f"主路：{road_to_text(user.get('current_road', []), 40)}\n\n"
-f"莊閒主路：{main_count}把\n"
-f"和局：{user.get('tie_count', 0) or 0}\n"
-f"莊對：{user.get('banker_pair_count', 0) or 0}\n"
-f"閒對：{user.get('player_pair_count', 0) or 0}\n\n"
-"請點選【開始分析】。"
-                    quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")]
-                )
-                continue
+    main_count = len(main_only(road))
+
+    if main_count < MIN_ROAD_LEN:
+        reply_text(
+            reply_token,
+            f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。\n"
+            "和局會記錄，但不計入莊閒主路把數。",
+            quick_items=qr_import_road()
+        )
+        continue
+
+    user = update_user(
+        line_user_id,
+        imported_ready=True,
+        analysis_active=False,
+        pending_flow=None
+    )
+
+    reply_text(
+        reply_token,
+        "✅ 匯入完成\n\n"
+        f"主路：{road_to_text(user.get('current_road', []), 40)}\n\n"
+        f"莊閒主路：{main_count}把\n"
+        f"和局：{user.get('tie_count', 0) or 0}\n"
+        f"莊對：{user.get('banker_pair_count', 0) or 0}\n"
+        f"閒對：{user.get('player_pair_count', 0) or 0}\n\n"
+        "請點選【開始分析】。",
+        quick_items=[
+            ("開始分析", "開始分析"),
+            ("點數配置", "點數配置")
+        ]
+    )
+
+    continue
 
             if text == "匯入莊":
                 road.append("莊")
