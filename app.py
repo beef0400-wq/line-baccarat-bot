@@ -1,21 +1,14 @@
-
 # -*- coding: utf-8 -*-
 # =========================
-# V13 完整商業版 app.py
+# V14 完整商業版 app.py
 # LINE 百家方向判讀系統
-# 功能：
-# - /callback Webhook
-# - PostgreSQL 自動建表（DATABASE_URL）
-# - 無 DATABASE_URL 時自動記憶體模式（測試用）
-# - 加好友自動 3 小時試用
-# - 試用結束後轉免費會員，鎖方向 / 詳細分析 / 點數配置
-# - VIP 有期限，例如 /vip ck76888 30
-# - 綁定帳號 / 待開通名單
-# - 點數配置：點數區間 / 打法模式 / 期望獲利
-# - 匯入牌路：至少 15 把；本輪不截斷，結束分析才清空
-# - V13 分析：多模型投票、長龍衰減、反連續校正、風險係數、狀態引擎
-# - 高低牌可選：高 / 低 或 莊 高、閒 低
-# - 詳細分析 / 本輪結算 / 命中紀錄
+# 本版重點：
+# - 保留 V13 原本激進點數風控
+# - 新增和局 / 3寶副模型
+# - 和局納入 current_road 紀錄
+# - 支援莊對 / 閒對 訊號記錄
+# - 長龍第7顆附近提示和局觀察
+# - 和後提示和 / 莊對 / 閒對 3寶觀察
 # =========================
 
 from flask import Flask, request, abort
@@ -36,9 +29,7 @@ except Exception:
     psycopg2 = None
 
 app = Flask(__name__)
-VERSION_MARKER = "V13_ADMIN_LINK_CLEAN"
-print("🔥 LOADED", VERSION_MARKER, flush=True)
-VERSION_MARKER = "V13_ADMIN_LINK_CLEAN"
+VERSION_MARKER = "V14_TIE_TREASURE_MODEL"
 print("🔥 LOADED", VERSION_MARKER, flush=True)
 
 # =========================
@@ -198,6 +189,9 @@ def init_db():
                 current_road JSONB NOT NULL DEFAULT '[]'::jsonb,
                 high_count INTEGER NOT NULL DEFAULT 0,
                 low_count INTEGER NOT NULL DEFAULT 0,
+                tie_count INTEGER NOT NULL DEFAULT 0,
+                banker_pair_count INTEGER NOT NULL DEFAULT 0,
+                player_pair_count INTEGER NOT NULL DEFAULT 0,
                 pending_flow TEXT,
                 imported_ready BOOLEAN NOT NULL DEFAULT FALSE,
                 analysis_active BOOLEAN NOT NULL DEFAULT FALSE,
@@ -225,7 +219,6 @@ def init_db():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
             """)
-            # analysis_logs migration safety
             log_cols = [
                 ("line_user_id", "TEXT"),
                 ("predicted", "TEXT"),
@@ -236,8 +229,6 @@ def init_db():
             for name, typ in log_cols:
                 cur.execute(f"ALTER TABLE analysis_logs ADD COLUMN IF NOT EXISTS {name} {typ};")
 
-            # LEGACY_LOG_COLUMNS_DYNAMIC_FIX
-            # 舊版 analysis_logs 可能殘留 NOT NULL 欄位；只處理存在的欄位
             cur.execute("""
             SELECT column_name
             FROM information_schema.columns
@@ -252,7 +243,6 @@ def init_db():
                     except Exception as e:
                         print("SKIP_LEGACY_LOG_COL:", col, repr(e), flush=True)
 
-            # migration safety
             cols = [
                 ("bound_account", "TEXT"),
                 ("vip_expire_at", "TIMESTAMP NULL"),
@@ -262,6 +252,9 @@ def init_db():
                 ("current_road", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
                 ("high_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("low_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("tie_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("banker_pair_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("player_pair_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("pending_flow", "TEXT"),
                 ("imported_ready", "BOOLEAN NOT NULL DEFAULT FALSE"),
                 ("analysis_active", "BOOLEAN NOT NULL DEFAULT FALSE"),
@@ -303,6 +296,9 @@ def default_user(line_user_id):
         "current_road": [],
         "high_count": 0,
         "low_count": 0,
+        "tie_count": 0,
+        "banker_pair_count": 0,
+        "player_pair_count": 0,
         "pending_flow": None,
         "imported_ready": False,
         "analysis_active": False,
@@ -367,6 +363,7 @@ def update_user(line_user_id, **fields):
         allowed = [
             "bound_account", "vip_expire_at", "trial_started_at", "trial_end_at",
             "trial_expired_notice_sent", "current_road", "high_count", "low_count",
+            "tie_count", "banker_pair_count", "player_pair_count",
             "pending_flow", "imported_ready", "analysis_active", "point_range",
             "play_mode", "target_profit", "last_prediction", "round_win", "round_loss",
             "win_streak", "loss_streak", "max_win_streak", "max_loss_streak", "updated_at"
@@ -408,12 +405,6 @@ def find_user_by_account(account):
     return None
 
 def add_log(line_user_id, predicted, actual, hit):
-    """
-    安全寫入分析紀錄。
-    舊版 DB 可能殘留 banker_pct / player_pct 等 NOT NULL 欄位。
-    這裡會動態讀取 analysis_logs 實際欄位，能填的都填。
-    即使 DB 紀錄失敗，也不讓 LINE 回覆中斷。
-    """
     if use_db():
         try:
             with db_conn() as conn:
@@ -443,8 +434,6 @@ def add_log(line_user_id, predicted, actual, hit):
                         "actual": actual,
                         "hit": hit,
                         "created_at": now_tw().replace(tzinfo=None),
-
-                        # 舊版殘留欄位安全預設值
                         "banker_pct": 0,
                         "player_pct": 0,
                         "confidence": 0,
@@ -470,7 +459,6 @@ def add_log(line_user_id, predicted, actual, hit):
                             vals.append(known_values[col])
                             continue
 
-                        # 舊欄位若 NOT NULL 且無預設，補安全值
                         if nullable == "NO" and default is None:
                             cols.append(col)
                             if any(x in dtype for x in ["int", "numeric", "double", "real", "decimal"]):
@@ -572,7 +560,7 @@ def reply_text(reply_token, text, quick_items=None):
         payload["messages"][0]["quickReply"] = quick_reply(quick_items)
     try:
         requests.post(
-            "https://api.line.me/v2/bot/message/reply",
+            LINE_REPLY_API,
             headers={
                 "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
                 "Content-Type": "application/json"
@@ -619,9 +607,61 @@ def qr_analysis():
         ("閒-高", "閒-高"),
         ("閒-低", "閒-低"),
         ("和", "和"),
+        ("莊對", "莊對"),
+        ("閒對", "閒對"),
         ("詳細分析", "詳細分析"),
         ("結束分析", "結束分析"),
     ]
+
+def qr_import_road():
+    return [
+        ("莊", "匯入莊"),
+        ("閒", "匯入閒"),
+        ("和", "匯入和"),
+        ("莊對", "匯入莊對"),
+        ("閒對", "匯入閒對"),
+        ("完成匯入", "完成匯入"),
+        ("清空重來", "清空匯入"),
+    ]
+
+def import_status_text(user, last_note=""):
+    road = user.get("current_road", [])
+    main_count = len(main_only(road))
+    tie_count = user.get("tie_count", 0) or 0
+    banker_pair_count = user.get("banker_pair_count", 0) or 0
+    player_pair_count = user.get("player_pair_count", 0) or 0
+
+    note = f"已記錄：{last_note}
+
+" if last_note else ""
+    recent = road_to_text(road, 30) or "尚未輸入"
+
+    return (
+        f"{note}📥 按鈕匯入牌路中
+
+"
+        f"主路進度：{main_count} / {MIN_ROAD_LEN}
+"
+        f"和局：{tie_count}
+"
+        f"莊對：{banker_pair_count}
+"
+        f"閒對：{player_pair_count}
+
+"
+        "━━━━━━━━━━━━━━━
+
+"
+        f"最近牌路：
+{recent}
+
+"
+        "操作方式：
+"
+        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】
+"
+        "滿15把莊閒主路後，按【完成匯入】。"
+    )
 
 # =========================
 # Text templates
@@ -638,6 +678,8 @@ def feature_intro_text():
         "同步查看變化與穩定度\n\n"
         "▍多模型投票\n"
         "整合序列、尾段、交錯率、長龍衰減與反連續校正\n\n"
+        "▍和局 / 3寶副模型\n"
+        "偵測長龍第7顆、和後連動、莊對 / 閒對活躍度\n\n"
         "▍點數配置\n"
         "依點數區間、打法模式、期望獲利與風險係數動態調整\n\n"
         "▍高低牌權重（選用）\n"
@@ -645,6 +687,7 @@ def feature_intro_text():
         "━━━━━━━━━━━━━━━\n\n"
         "系統會提供：\n"
         "👉 當前方向參考\n"
+        "👉 和局 / 3寶觀察\n"
         "👉 系統狀態\n"
         "👉 風險提示\n"
         "👉 點數配置建議\n"
@@ -677,14 +720,14 @@ def member_guide_text():
         "輸入【開始分析】進入即時模式\n"
         "每把輸入：莊 / 閒 / 和\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "⑦ 高低牌（VIP即時按鍵）\n"
-        "即時分析時請優先點選：\n"
-        "莊-高 / 莊-低 / 閒-高 / 閒-低 / 和\n\n"
+        "⑦ 高低牌與對子\n"
+        "即時分析時可點選：\n"
+        "莊-高 / 莊-低 / 閒-高 / 閒-低 / 和 / 莊對 / 閒對\n\n"
         "說明：0～5 視為低牌；6～9 視為高牌\n"
         "若不確定高低，也可只輸入：莊 / 閒 / 和\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "⑧ 詳細分析\n"
-        "查看序列、四路、穩定度、點數與本輪紀錄\n\n"
+        "查看序列、四路、穩定度、和局3寶、點數與本輪紀錄\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "⑨ 結束分析\n"
         "輸入【結束分析】查看本輪結果並清空本輪"
@@ -701,10 +744,10 @@ def open_full_access_text():
         "③ 聯繫管理員\n"
         "請點以下連結直接聯繫：\n"
         "https://line.me/R/ti/p/@163brkzi\n\n"
-        ""
         "━━━━━━━━━━━━━━━\n\n"
         "開通後即可使用：\n"
         "✔ 即時分析\n"
+        "✔ 和局 / 3寶觀察\n"
         "✔ 點數配置\n"
         "✔ 詳細分析\n"
         "✔ 本輪結算"
@@ -717,7 +760,7 @@ def trial_expired_text():
         "目前完整分析已暫停顯示\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "本局已進入關鍵結構區\n"
-        "但方向與點數配置已鎖定\n\n"
+        "但方向、3寶觀察與點數配置已鎖定\n\n"
         "👉 需開通後查看\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "如需繼續使用完整分析\n"
@@ -731,11 +774,12 @@ def free_user_locked_text():
         "包含：\n"
         "▍序列比對\n"
         "▍四路結構\n"
-        "▍穩定度分析\n\n"
+        "▍穩定度分析\n"
+        "▍和局 / 3寶偵測\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "⚠️ 關鍵判讀已鎖定\n"
         "目前為完整分析內容\n\n"
-        "👉 方向 / 狀態 / 點數配置\n"
+        "👉 方向 / 3寶 / 狀態 / 點數配置\n"
         "需開通後查看\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "如需繼續使用\n"
@@ -752,7 +796,7 @@ def get_status_text(user):
     return (
         "目前狀態：免費會員\n\n"
         "完整分析內容已鎖定。\n"
-        "如需方向、詳細分析與點數配置，請點選【找管理員】開通。"
+        "如需方向、3寶觀察、詳細分析與點數配置，請點選【找管理員】開通。"
     )
 
 def menu_text(user):
@@ -775,7 +819,7 @@ def menu_text(user):
     )
 
 # =========================
-# Analysis V13
+# Analysis V14
 # =========================
 def extract_results(text):
     return re.findall(r"[莊閒和]", text)
@@ -847,7 +891,6 @@ def sequence_match_score(seq, max_k=6):
     return score, "找到尾段相似樣本", details
 
 def subroad_model(seq):
-    # 近似版：用段長變化模擬大眼仔/小路/曱甴路穩定度
     segs = calc_segments(seq)
     if len(segs) < 6:
         return {"big_eye": "灰", "small": "灰", "cockroach": "灰", "stability": 40, "note": "樣本偏少"}
@@ -885,6 +928,137 @@ def high_low_weight(user):
         return 0.86, "低牌偏多，波動偏高", high, low
     return 1.0, "高低牌均衡", high, low
 
+def last_raw_result(road):
+    for x in reversed(road):
+        if x in ["莊", "閒", "和"]:
+            return x
+    return None
+
+def treasure_model(user):
+    """
+    和局 / 3寶副模型 V15。
+    核心：和、莊對、閒對分開計分，只顯示最有價值的1～2個觀察點。
+    3寶 = 和 / 莊對 / 閒對。
+    """
+    road = user.get("current_road", [])
+    seq = main_only(road)
+
+    if len(seq) < MIN_ROAD_LEN:
+        return None
+
+    streak_len, last = current_streak(seq)
+    raw_last = last_raw_result(road)
+
+    tie_count = user.get("tie_count", 0) or 0
+    banker_pair_count = user.get("banker_pair_count", 0) or 0
+    player_pair_count = user.get("player_pair_count", 0) or 0
+
+    recent_raw = road[-12:]
+    recent_ties = sum(1 for x in recent_raw if x == "和")
+    pair_total = banker_pair_count + player_pair_count
+
+    scores = {
+        "和": 0,
+        "莊對": 0,
+        "閒對": 0,
+    }
+    reasons = {
+        "和": [],
+        "莊對": [],
+        "閒對": [],
+    }
+
+    # 1. 長龍第7顆：只加和局，不亂加對子
+    if streak_len >= 6:
+        scores["和"] += 3
+        reasons["和"].append(f"長龍已達{streak_len}顆，第7顆附近有和局觀察點")
+
+    # 2. 和後擴散：和 / 莊對 / 閒對都提高，但不代表一定三個都喊
+    if raw_last == "和":
+        scores["和"] += 2
+        scores["莊對"] += 2
+        scores["閒對"] += 2
+        reasons["和"].append("上一把開和，和局活躍度提高")
+        reasons["莊對"].append("和後進入3寶擴散區")
+        reasons["閒對"].append("和後進入3寶擴散區")
+
+    # 3. 近12把和局密度
+    if recent_ties >= 2:
+        scores["和"] += 2
+        reasons["和"].append(f"近12把出現{recent_ties}次和")
+    if recent_ties >= 3:
+        scores["和"] += 1
+        reasons["和"].append("和局密度偏高，但只建議小注觀察")
+
+    # 4. 對子熱度分流：哪邊熱就加哪邊，不再同時亂喊
+    if banker_pair_count > player_pair_count and banker_pair_count >= 2:
+        scores["莊對"] += 3
+        reasons["莊對"].append("本輪莊對比閒對活躍")
+    elif player_pair_count > banker_pair_count and player_pair_count >= 2:
+        scores["閒對"] += 3
+        reasons["閒對"].append("本輪閒對比莊對活躍")
+    elif banker_pair_count >= 1 and player_pair_count >= 1:
+        scores["莊對"] += 1
+        scores["閒對"] += 1
+        reasons["莊對"].append("本輪已有莊對訊號")
+        reasons["閒對"].append("本輪已有閒對訊號")
+
+    # 5. 長龍方向搭配對子：長莊偏看莊對，長閒偏看閒對，但權重低於和局
+    if streak_len >= 5 and last == "莊":
+        scores["莊對"] += 1
+        reasons["莊對"].append("莊路長段，莊對小幅加權")
+    elif streak_len >= 5 and last == "閒":
+        scores["閒對"] += 1
+        reasons["閒對"].append("閒路長段，閒對小幅加權")
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    top_name, top_score = ranked[0]
+
+    if top_score < 3:
+        return None
+
+    second_name, second_score = ranked[1]
+    picks = [top_name]
+    if second_score >= 3 and second_score >= top_score - 1:
+        picks.append(second_name)
+
+    if top_score >= 6:
+        level = "強觀察"
+    elif top_score >= 4:
+        level = "中觀察"
+    else:
+        level = "弱觀察"
+
+    reason_lines = []
+    for name in picks:
+        for r in reasons[name]:
+            if r not in reason_lines:
+                reason_lines.append(f"{name}：{r}")
+
+    if top_name == "和" and streak_len >= 6:
+        note = "長龍第7顆附近，主看和局小注觀察。"
+    elif raw_last == "和":
+        note = "和後進入3寶擴散區，只看分數最高項目。"
+    elif top_name in ["莊對", "閒對"]:
+        note = f"{top_name}訊號較活躍，可小注觀察。"
+    else:
+        note = "3寶訊號出現，但不可重壓。"
+
+    return {
+        "level": level,
+        "target": " / ".join(picks),
+        "main_pick": top_name,
+        "sub_pick": second_name if len(picks) > 1 else None,
+        "score": top_score,
+        "scores": scores,
+        "note": note,
+        "reasons": reason_lines,
+        "tie_count": tie_count,
+        "banker_pair_count": banker_pair_count,
+        "player_pair_count": player_pair_count,
+        "recent_ties": recent_ties,
+    }
+
 def analyze_v13(user):
     road = user.get("current_road", [])
     seq = main_only(road)
@@ -894,7 +1068,6 @@ def analyze_v13(user):
     score = {"莊": 50.0, "閒": 50.0}
     reasons = []
 
-    # 1. frequency
     c = Counter(seq)
     total = c["莊"] + c["閒"]
     freq_b = c["莊"] / max(1, total)
@@ -902,13 +1075,11 @@ def analyze_v13(user):
     score["莊"] += (freq_b - 0.5) * 12
     score["閒"] += (freq_p - 0.5) * 12
 
-    # 2. sequence match
     sm, sm_note, sm_details = sequence_match_score(seq)
     score["莊"] += sm["莊"] * 8
     score["閒"] += sm["閒"] * 8
     reasons.append(sm_note)
 
-    # 3. tail dynamics + dragon decay
     streak_len, last = current_streak(seq)
     if last:
         if streak_len <= 3:
@@ -927,10 +1098,8 @@ def analyze_v13(user):
     else:
         tail_note = "尾段不足"
 
-    # 4. chop/segment
     cr = chop_rate(seq[-25:])
     if cr >= 62:
-        # high chop, favor opposite of last slightly
         if last:
             other = "閒" if last == "莊" else "莊"
             score[other] += 4
@@ -942,7 +1111,6 @@ def analyze_v13(user):
     else:
         structure_note = f"交錯率{cr}%，中性"
 
-    # 5. subroad stability
     sub = subroad_model(seq)
     if sub["stability"] >= 60 and last:
         score[last] += 4
@@ -950,19 +1118,16 @@ def analyze_v13(user):
         other = "閒" if last == "莊" else "莊"
         score[other] += 3
 
-    # clamp final
     raw_gap = abs(score["莊"] - score["閒"])
     if score["莊"] >= score["閒"]:
         direction = "莊"
     else:
         direction = "閒"
 
-    # convert to percent, keep reasonable range
     pct = 50 + min(18, round(raw_gap / 2))
     if pct > 68:
         pct = 68
 
-    # signal
     if pct >= 64:
         signal = "強"
     elif pct >= 59:
@@ -972,7 +1137,6 @@ def analyze_v13(user):
     else:
         signal = "弱"
 
-    # risk
     risk_score = 0
     if sub["stability"] < 40:
         risk_score += 2
@@ -992,7 +1156,6 @@ def analyze_v13(user):
     else:
         risk = "低"
 
-    # state: no more hard stop unless extreme
     if pct <= 53 and sub["stability"] < 38 and not sm_details:
         state = "⛔ 暫停"
         state_coef = 0.0
@@ -1013,6 +1176,7 @@ def analyze_v13(user):
         state_coef = 0.7
 
     hl_coef, hl_note, high, low = high_low_weight(user)
+    treasure = treasure_model(user)
 
     return {
         "direction": direction,
@@ -1029,9 +1193,11 @@ def analyze_v13(user):
         "sub": sub,
         "match_note": sm_note,
         "match_details": sm_details,
+        "treasure": treasure,
         "metrics": {
             "莊": c["莊"],
             "閒": c["閒"],
+            "和": sum(1 for x in road if x == "和"),
             "交錯率": cr,
             "平均段長": round(sum(x[1] for x in calc_segments(seq)) / max(1, len(calc_segments(seq))), 2),
             "最長連續": max([x[1] for x in calc_segments(seq)] or [0]),
@@ -1068,7 +1234,7 @@ def calculate_points(user, analysis):
     state_coef = analysis["state_coef"]
     hl_coef = analysis["hl_coef"]
 
-    # streak adjustment
+    # 保留原本激進版風控：連勝放大，連敗降速 / 暫停
     win_streak = user.get("win_streak", 0) or 0
     loss_streak = user.get("loss_streak", 0) or 0
 
@@ -1136,6 +1302,20 @@ def point_config_card(user):
 def decision_card(user, analysis):
     points = calculate_points(user, analysis)
     point_text = points["text"] if points else "尚未設定，請先點選【點數配置】"
+
+    treasure = analysis.get("treasure")
+    if treasure:
+        treasure_text = (
+            "\n━━━━━━━━━━━━━━━\n\n"
+            "🟡 和局 / 3寶觀察\n"
+            f"目標：{treasure['target']}\n"
+            f"強度：{treasure['level']}\n"
+            f"說明：{treasure['note']}\n"
+            "⚠️ 僅小注觀察，不建議重壓\n"
+        )
+    else:
+        treasure_text = ""
+
     return (
         f"已記錄：{road_to_text(user.get('current_road', [])[-1:])}\n\n"
         "🎯 方向\n\n"
@@ -1146,9 +1326,10 @@ def decision_card(user, analysis):
         "💰 點數\n"
         f"👉 {point_text}\n\n"
         f"⚠️ 風險：{analysis['risk']}\n"
-        f"📌 建議模式：{user.get('play_mode') or '尚未設定'}\n\n"
+        f"📌 建議模式：{user.get('play_mode') or '尚未設定'}\n"
+        f"{treasure_text}\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "操作：莊-高 / 莊-低 / 閒-高 / 閒-低 / 和 / 詳細分析 / 結束分析"
+        "操作：莊-高 / 莊-低 / 閒-高 / 閒-低 / 和 / 莊對 / 閒對 / 詳細分析 / 結束分析"
     )
 
 def detail_card(user, analysis):
@@ -1158,8 +1339,28 @@ def detail_card(user, analysis):
     total_round = (user.get("round_win", 0) or 0) + (user.get("round_loss", 0) or 0)
     rate = round((user.get("round_win", 0) or 0) * 100 / total_round) if total_round else 0
 
+    treasure = analysis.get("treasure")
+    if treasure:
+        treasure_detail = (
+            "▍和局 / 3寶副模型\n"
+            f"目標：{treasure['target']}\n"
+            f"強度：{treasure['level']}\n"
+            f"分數：{treasure['score']}\n"
+            f"本輪和局：{treasure['tie_count']}\n"
+            f"莊對：{treasure['banker_pair_count']} / 閒對：{treasure['player_pair_count']}\n"
+            + "\n".join([f"・{x}" for x in treasure["reasons"]])
+            + "\n\n"
+        )
+    else:
+        treasure_detail = (
+            "▍和局 / 3寶副模型\n"
+            f"本輪和局：{user.get('tie_count', 0) or 0}\n"
+            f"莊對：{user.get('banker_pair_count', 0) or 0} / 閒對：{user.get('player_pair_count', 0) or 0}\n"
+            "目前無明顯訊號\n\n"
+        )
+
     return (
-        "📊 詳細分析 V13\n\n"
+        "📊 詳細分析 V14\n\n"
         f"目前牌路：\n{road_to_text(main_only(user.get('current_road', [])), 30)}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "預測機率：\n"
@@ -1181,6 +1382,7 @@ def detail_card(user, analysis):
         f"曱甴路：{analysis['sub']['cockroach']}\n"
         f"穩定度：{analysis['sub']['stability']}\n"
         f"{analysis['sub']['note']}\n\n"
+        f"{treasure_detail}"
         "▍牌值權重\n"
         f"{analysis['hl_note']}\n"
         f"高牌：{analysis['high']} / 低牌：{analysis['low']}\n\n"
@@ -1188,6 +1390,7 @@ def detail_card(user, analysis):
         "數據指標：\n"
         f"莊：{analysis['metrics']['莊']}\n"
         f"閒：{analysis['metrics']['閒']}\n"
+        f"和：{analysis['metrics']['和']}\n"
         f"交錯率：{analysis['metrics']['交錯率']}%\n"
         f"平均段長：{analysis['metrics']['平均段長']}\n"
         f"最長連續：{analysis['metrics']['最長連續']}\n\n"
@@ -1233,7 +1436,9 @@ def settlement_card(user):
         f"結果：{win} / {total}\n"
         f"命中率：{rate}%\n"
         f"最大連順：{max_win}\n"
-        f"最大連失：{max_loss}\n\n"
+        f"最大連失：{max_loss}\n"
+        f"本輪和局：{user.get('tie_count', 0) or 0}\n"
+        f"莊對：{user.get('banker_pair_count', 0) or 0} / 閒對：{user.get('player_pair_count', 0) or 0}\n\n"
         "━━━━━━━━━━━━━━━\n\n"
         "🧠 評價\n"
         f"{eval_text}\n\n"
@@ -1268,7 +1473,6 @@ def callback():
         is_admin = is_admin_line_id(line_user_id)
 
         if event_type == "follow":
-            # ensure_user already starts trial
             reply_text(
                 reply_token,
                 menu_text(user) + "\n\n🎁 已開啟3小時免費試用\n試用期間可使用完整分析功能。",
@@ -1384,7 +1588,7 @@ def callback():
             reply_text(reply_token, f"已綁定帳號：{text}\n請聯絡管理員確認開通。", quick_items=qr_main(is_admin))
             continue
 
-        # Point config flow: free users can enter config menu but locked from final use? allow trial/VIP full, free show opening.
+        # Point config
         if text == "點數配置":
             if not has_full_access(user):
                 reply_text(reply_token, free_user_locked_text(), quick_items=qr_main(is_admin))
@@ -1413,8 +1617,8 @@ def callback():
             reply_text(reply_token, point_config_card(user), quick_items=qr_main(is_admin))
             continue
 
-        # Access lock for analysis related commands
-        full_access_commands = ["開始分析", "詳細分析", "莊", "閒", "和", "高", "低"]
+        # Access lock
+        full_access_commands = ["開始分析", "詳細分析", "莊", "閒", "和", "高", "低", "莊對", "閒對"]
         if trial_just_expired and text in full_access_commands:
             reply_text(reply_token, trial_expired_text(), quick_items=qr_main(is_admin))
             continue
@@ -1424,15 +1628,109 @@ def callback():
 
         # Import flow
         if text == "匯入牌路":
-            update_user(line_user_id, pending_flow="import_road")
-            reply_text(reply_token, f"請輸入目前牌路，至少{MIN_ROAD_LEN}把。\n例：莊莊閒閒莊閒莊閒莊莊閒閒莊閒莊")
+            user = update_user(
+                line_user_id,
+                pending_flow="import_buttons",
+                current_road=[],
+                imported_ready=False,
+                analysis_active=False,
+                high_count=0,
+                low_count=0,
+                tie_count=0,
+                banker_pair_count=0,
+                player_pair_count=0,
+                last_prediction=None,
+                round_win=0,
+                round_loss=0,
+                win_streak=0,
+                loss_streak=0,
+                max_win_streak=0,
+                max_loss_streak=0,
+            )
+            reply_text(reply_token, import_status_text(user), quick_items=qr_import_road())
             continue
+
+        if user.get("pending_flow") == "import_buttons" and text in ["匯入莊", "匯入閒", "匯入和", "匯入莊對", "匯入閒對", "完成匯入", "清空匯入"]:
+            road = user.get("current_road", [])
+
+            if text == "清空匯入":
+                user = update_user(
+                    line_user_id,
+                    current_road=[],
+                    high_count=0,
+                    low_count=0,
+                    tie_count=0,
+                    banker_pair_count=0,
+                    player_pair_count=0,
+                    imported_ready=False,
+                    analysis_active=False,
+                )
+                reply_text(reply_token, import_status_text(user, "已清空，重新開始"), quick_items=qr_import_road())
+                continue
+
+            if text == "完成匯入":
+                main_count = len(main_only(road))
+                if main_count < MIN_ROAD_LEN:
+                    reply_text(reply_token, f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。
+和局會記錄，但不計入莊閒主路把數。", quick_items=qr_import_road())
+                    continue
+                user = update_user(line_user_id, imported_ready=True, analysis_active=False, pending_flow=None)
+                reply_text(
+                    reply_token,
+                    "✅ 匯入完成
+
+"
+                    f"主路：{road_to_text(user.get('current_road', []), 40)}
+
+"
+                    f"莊閒主路：{main_count}把
+"
+                    f"和局：{user.get('tie_count', 0) or 0}
+"
+                    f"莊對：{user.get('banker_pair_count', 0) or 0}
+"
+                    f"閒對：{user.get('player_pair_count', 0) or 0}
+
+"
+                    "請點選【開始分析】。",
+                    quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")]
+                )
+                continue
+
+            if text == "匯入莊":
+                road.append("莊")
+                user = update_user(line_user_id, current_road=road)
+                reply_text(reply_token, import_status_text(user, "莊"), quick_items=qr_import_road())
+                continue
+
+            if text == "匯入閒":
+                road.append("閒")
+                user = update_user(line_user_id, current_road=road)
+                reply_text(reply_token, import_status_text(user, "閒"), quick_items=qr_import_road())
+                continue
+
+            if text == "匯入和":
+                road.append("和")
+                user = update_user(line_user_id, current_road=road, tie_count=(user.get("tie_count", 0) or 0) + 1)
+                reply_text(reply_token, import_status_text(user, "和"), quick_items=qr_import_road())
+                continue
+
+            if text == "匯入莊對":
+                user = update_user(line_user_id, banker_pair_count=(user.get("banker_pair_count", 0) or 0) + 1)
+                reply_text(reply_token, import_status_text(user, "莊對"), quick_items=qr_import_road())
+                continue
+
+            if text == "匯入閒對":
+                user = update_user(line_user_id, player_pair_count=(user.get("player_pair_count", 0) or 0) + 1)
+                reply_text(reply_token, import_status_text(user, "閒對"), quick_items=qr_import_road())
+                continue
 
         if user.get("pending_flow") == "import_road":
             results = extract_results(text)
             main = [x for x in results if x in ["莊", "閒"]]
             if len(main) < MIN_ROAD_LEN:
-                reply_text(reply_token, f"目前只有{len(main)}把，請至少輸入{MIN_ROAD_LEN}把。")
+                reply_text(reply_token, f"目前只有{len(main)}把莊閒主路，請至少輸入{MIN_ROAD_LEN}把。
+建議改用【匯入牌路】按鈕模式，避免莊對/閒對被誤判。")
                 continue
             user = update_user(
                 line_user_id,
@@ -1449,15 +1747,20 @@ def callback():
                 last_prediction=None,
                 high_count=0,
                 low_count=0,
+                tie_count=sum(1 for x in results if x == "和"),
+                banker_pair_count=0,
+                player_pair_count=0,
             )
-            reply_text(reply_token, f"已匯入牌路：{len(main)}把\n請點選【開始分析】。", quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")])
+            reply_text(reply_token, f"已匯入牌路：莊閒主路{len(main)}把 / 和局{sum(1 for x in results if x == '和')}把
+請點選【開始分析】。", quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")])
             continue
 
         if text == "開始分析":
             road = user.get("current_road", [])
             if len(main_only(road)) < MIN_ROAD_LEN:
-                update_user(line_user_id, pending_flow="import_road")
-                reply_text(reply_token, f"請先匯入至少{MIN_ROAD_LEN}把牌路。")
+                user = update_user(line_user_id, pending_flow="import_buttons")
+                reply_text(reply_token, f"請先匯入至少{MIN_ROAD_LEN}把莊閒主路。
+和局可記錄，但不計入主路把數。", quick_items=qr_import_road())
                 continue
             user = update_user(line_user_id, analysis_active=True)
             analysis = analyze_v13(user)
@@ -1482,6 +1785,9 @@ def callback():
                 current_road=[],
                 high_count=0,
                 low_count=0,
+                tie_count=0,
+                banker_pair_count=0,
+                player_pair_count=0,
                 imported_ready=False,
                 analysis_active=False,
                 pending_flow=None,
@@ -1494,6 +1800,16 @@ def callback():
                 max_loss_streak=0,
             )
             reply_text(reply_token, summary + "\n\n你可以重新匯入牌路，或調整點數配置。", quick_items=qr_main(is_admin))
+            continue
+
+        # Pair only
+        if text in ["莊對", "庄對", "閒對", "闲對"]:
+            if text in ["莊對", "庄對"]:
+                user = update_user(line_user_id, banker_pair_count=(user.get("banker_pair_count", 0) or 0) + 1)
+                reply_text(reply_token, "已記錄：莊對", quick_items=qr_analysis())
+            else:
+                user = update_user(line_user_id, player_pair_count=(user.get("player_pair_count", 0) or 0) + 1)
+                reply_text(reply_token, "已記錄：閒對", quick_items=qr_analysis())
             continue
 
         # High/low only
@@ -1517,16 +1833,18 @@ def callback():
             prior_prediction = user.get("last_prediction")
             actual_for_score = None
 
-            # Add only actual result chars, do not truncate
             high_add = 1 if "高" in text else 0
             low_add = 1 if "低" in text else 0
+            tie_add = sum(1 for x in results if x == "和")
+            banker_pair_add = 1 if "莊對" in text or "庄對" in text else 0
+            player_pair_add = 1 if "閒對" in text or "闲對" in text else 0
 
             for r in results:
                 road.append(r)
                 if r in ["莊", "閒"] and actual_for_score is None:
                     actual_for_score = r
 
-            # score previous prediction after new actual
+            # 只用莊 / 閒結算上一把預測；和局不算輸贏
             if prior_prediction and actual_for_score:
                 hit = prior_prediction == actual_for_score
                 add_log(line_user_id, prior_prediction, actual_for_score, hit)
@@ -1554,10 +1872,16 @@ def callback():
                 current_road=road,
                 high_count=(user.get("high_count", 0) or 0) + high_add,
                 low_count=(user.get("low_count", 0) or 0) + low_add,
+                tie_count=(user.get("tie_count", 0) or 0) + tie_add,
+                banker_pair_count=(user.get("banker_pair_count", 0) or 0) + banker_pair_add,
+                player_pair_count=(user.get("player_pair_count", 0) or 0) + player_pair_add,
             )
 
             if len(main_only(road)) < MIN_ROAD_LEN:
-                reply_text(reply_token, f"已記錄：{''.join(results)}\n目前{len(main_only(road))}把，滿{MIN_ROAD_LEN}把後可開始分析。")
+                extra = ""
+                if tie_add:
+                    extra = "\n和局已記錄，但不計入莊閒主路把數。"
+                reply_text(reply_token, f"已記錄：{''.join(results)}\n目前莊閒主路{len(main_only(road))}把，滿{MIN_ROAD_LEN}把後可開始分析。{extra}")
                 continue
 
             analysis = analyze_v13(user)
