@@ -1815,12 +1815,31 @@ def callback():
         # Pair confirmation flow
         if user.get("pending_flow") == "pair_confirm" and text in ["無對子", "莊對", "閒對", "雙對"]:
             user = apply_pair_result(user, line_user_id, text)
+            user = get_user(line_user_id) or user
+
+            if len(main_only(user.get("current_road", []))) < MIN_ROAD_LEN:
+                reply_text(
+                    reply_token,
+                    f"已確認：{pair_summary(text)}\n\n"
+                    f"目前莊閒主路{len(main_only(user.get('current_road', [])))}把，滿{MIN_ROAD_LEN}把後可開始分析。",
+                    quick_items=qr_main_result()
+                )
+                continue
+
+            analysis = analyze_v15(user)
+            if "error" in analysis:
+                reply_text(reply_token, analysis["error"], quick_items=qr_main_result())
+                continue
+
+            if analysis.get("treasure"):
+                user = update_user(line_user_id, last_treasure_round=len(main_only(user.get("current_road", []))))
+
+            user = update_user(line_user_id, last_prediction=analysis["direction"])
             reply_text(
                 reply_token,
-                f"已確認：{pair_summary(text)}\n\n正在更新本局分析...",
+                f"已確認：{pair_summary(text)}\n\n" + decision_card(user, analysis),
+                quick_items=qr_after_analysis()
             )
-            user = get_user(line_user_id) or user
-            run_analysis_and_reply(reply_token, user, line_user_id)
             continue
 
         # Detail
