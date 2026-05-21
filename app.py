@@ -633,39 +633,22 @@ def import_status_text(user, last_note=""):
 
     note = ""
     if last_note:
-        note = f"已記錄：{last_note}
-
-"
+        note = f"已記錄：{last_note}\n\n"
 
     recent = road_to_text(road, 30) or "尚未輸入"
 
     return (
-        f"{note}📥 按鈕匯入牌路中
-
-"
-        f"主路進度：{main_count} / {MIN_ROAD_LEN}
-"
-        f"和局：{tie_count}
-"
-        f"莊對：{banker_pair_count}
-"
-        f"閒對：{player_pair_count}
-
-"
-        "━━━━━━━━━━━━━━━
-
-"
-        f"最近牌路：
-{recent}
-
-"
-        "操作方式：
-"
-        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】
-"
+        f"{note}📥 按鈕匯入牌路中\n\n"
+        f"主路進度：{main_count} / {MIN_ROAD_LEN}\n"
+        f"和局：{tie_count}\n"
+        f"莊對：{banker_pair_count}\n"
+        f"閒對：{player_pair_count}\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"最近牌路：\n{recent}\n\n"
+        "操作方式：\n"
+        "這把開閒+莊對 → 先按【莊/閒/和】再按【莊對/閒對】\n"
         "滿15把莊閒主路後，按【完成匯入】。"
     )
-
 # =========================
 # Text templates
 # =========================
@@ -1676,7 +1659,7 @@ def callback():
                 if main_count < MIN_ROAD_LEN:
                     reply_text(
                         reply_token,
-                        f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。
+                        f"目前莊閒主路只有{main_count}把，至少需要{MIN_ROAD_LEN}把。\n"
 "
                         "和局會記錄，但不計入莊閒主路把數。",
                         quick_items=qr_import_road()
@@ -1685,22 +1668,13 @@ def callback():
                 user = update_user(line_user_id, imported_ready=True, analysis_active=False, pending_flow=None)
                 reply_text(
                     reply_token,
-                    "✅ 匯入完成
-
-"
-                    f"主路：{road_to_text(user.get('current_road', []), 40)}
-
-"
-                    f"莊閒主路：{main_count}把
-"
-                    f"和局：{user.get('tie_count', 0) or 0}
-"
-                    f"莊對：{user.get('banker_pair_count', 0) or 0}
-"
-                    f"閒對：{user.get('player_pair_count', 0) or 0}
-
-"
-                    "請點選【開始分析】。",
+                    "✅ 匯入完成\n\n"
+f"主路：{road_to_text(user.get('current_road', []), 40)}\n\n"
+f"莊閒主路：{main_count}把\n"
+f"和局：{user.get('tie_count', 0) or 0}\n"
+f"莊對：{user.get('banker_pair_count', 0) or 0}\n"
+f"閒對：{user.get('player_pair_count', 0) or 0}\n\n"
+"請點選【開始分析】。"
                     quick_items=[("開始分析", "開始分析"), ("點數配置", "點數配置")]
                 )
                 continue
