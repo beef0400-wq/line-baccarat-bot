@@ -540,6 +540,10 @@ def in_trial(user):
 def has_full_access(user):
     return is_vip(user) or in_trial(user)
 
+def refresh_user(line_user_id, fallback=None):
+    """Always re-read the latest user state after VIP/admin updates."""
+    return get_user(line_user_id) or fallback or ensure_user(line_user_id)
+
 def check_trial_transition(user):
     if not user or is_vip(user):
         return user, False
@@ -1645,11 +1649,17 @@ def callback():
 
             expire = now_tw() + timedelta(days=days)
             update_user(target["line_user_id"], vip_expire_at=expire)
+
+            # 若開通的是目前這個 LINE 使用者，立刻刷新權限狀態
+            if target["line_user_id"] == line_user_id:
+                user = refresh_user(line_user_id, user)
+
             reply_text(reply_token, f"已開通VIP\n帳號：{account}\n天數：{days}天\n到期：{dt_to_str(expire)}")
             continue
 
         # General commands
         if text == "開始":
+            user = refresh_user(line_user_id, user)
             reply_text(reply_token, menu_text(user), quick_items=qr_main(is_admin))
             continue
 
@@ -1666,6 +1676,7 @@ def callback():
             continue
 
         if text == "查詢資格":
+            user = refresh_user(line_user_id, user)
             reply_text(reply_token, get_status_text(user), quick_items=qr_main(is_admin))
             continue
 
@@ -1693,6 +1704,7 @@ def callback():
 
         # Point config
         if text == "點數配置":
+            user = refresh_user(line_user_id, user)
             if not has_full_access(user):
                 reply_text(reply_token, free_user_locked_text(), quick_items=qr_main(is_admin))
                 continue
@@ -1721,9 +1733,11 @@ def callback():
             continue
 
         # Access lock
+        user = refresh_user(line_user_id, user)
         full_access_commands = [
             "匯入牌路", "開始分析", "詳細分析", "莊", "閒", "和",
-            "無對子", "莊對", "閒對", "雙對", "高牌", "低牌", "跳過牌值"
+            "無對子", "莊對", "閒對", "雙對", "高牌", "低牌", "跳過牌值",
+            "莊-高", "莊-低", "閒-高", "閒-低", "高", "低"
         ]
         if trial_just_expired and text in full_access_commands:
             reply_text(reply_token, trial_expired_text(), quick_items=qr_main(is_admin))
@@ -1734,6 +1748,7 @@ def callback():
 
         # Import flow
         if text == "匯入牌路":
+            user = refresh_user(line_user_id, user)
             user = update_user(
                 line_user_id,
                 pending_flow="import_buttons",
@@ -1820,6 +1835,7 @@ def callback():
 
         # Start analysis
         if text == "開始分析":
+            user = refresh_user(line_user_id, user)
             road = user.get("current_road", [])
             if len(main_only(road)) < MIN_ROAD_LEN:
                 user = update_user(line_user_id, pending_flow="import_buttons")
@@ -1879,6 +1895,7 @@ def callback():
 
         # Detail
         if text == "詳細分析":
+            user = refresh_user(line_user_id, user)
             analysis = analyze_v15(user)
             if "error" in analysis:
                 reply_text(reply_token, analysis["error"], quick_items=qr_main_result())
