@@ -694,7 +694,7 @@ def member_guide_text():
     return (
         "📘 使用教學\n\n"
         "① 註冊帳號\n"
-        "sn043.aaawin88.com\n\n"
+        "AI001.aaawin88.com\n\n"
         "② 綁定帳號\n"
         "點選【綁定帳號】或輸入：綁定 ck76888\n\n"
         "③ 點數配置\n"
@@ -714,7 +714,7 @@ def open_full_access_text():
         "👤 找管理員\n\n"
         "如需開通完整功能，請先完成：\n\n"
         "① 註冊帳號\n"
-        "sn043.aaawin88.com\n\n"
+        "AI001.aaawin88.com\n\n"
         "② 綁定帳號\n"
         "點選【綁定帳號】或輸入：綁定 你的帳號\n\n"
         "③ 聯繫管理員\n"
@@ -1566,6 +1566,7 @@ def callback():
         event_type = event.get("type")
         source = event.get("source", {})
         line_user_id = source.get("userId")
+        print("USER_ID =", line_user_id, flush=True)
         reply_token = event.get("replyToken")
 
         if not line_user_id:
@@ -1593,7 +1594,26 @@ def callback():
         text = msg.get("text", "").strip()
         user, trial_just_expired = check_trial_transition(user)
 
+        # Show current LINE User ID for adding admins
+        if text in ["/myid", "我的ID", "我的id", "查ID", "查id"]:
+            reply_text(reply_token, f"你的 LINE User ID：\n{line_user_id}")
+            continue
+
         # Admin commands
+        if text == "/adminhelp":
+            if not is_admin:
+                reply_text(reply_token, "此指令僅限管理員。")
+                continue
+            reply_text(
+                reply_token,
+                "管理員指令：\n"
+                "/myid：查自己的 LINE User ID\n"
+                "/待開通：查看待開通名單\n"
+                "/vip 帳號 天數：開通 VIP\n"
+                "例：/vip ck76888 30"
+            )
+            continue
+
         if text == "/待開通":
             if not is_admin:
                 reply_text(reply_token, "此指令僅限管理員。")
