@@ -31,7 +31,9 @@ except Exception:
     psycopg2 = None
 
 app = Flask(__name__)
-VERSION_MARKER = "V15_CLEAN_ROAD_TREASURE_FLOW"
+VERSION_MARKER = "V15_RETIRED_20261009"
+# Owner retired this dedicated legacy service; archive/data remain intact.
+LEGACY_BOT_RETIRED = True
 print("🔥 LOADED", VERSION_MARKER, flush=True)
 
 # =========================
@@ -574,6 +576,8 @@ def quick_reply(items):
     }
 
 def reply_text(reply_token, text, quick_items=None):
+    if LEGACY_BOT_RETIRED:
+        return
     if not reply_token:
         return
     payload = {
@@ -1552,12 +1556,19 @@ def run_analysis_and_reply(reply_token, user, line_user_id):
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "OK - LINE Bot is running"
+    return "Legacy LINE bot retired; data preserved"
+
+@app.get("/health")
+def retirement_health():
+    return {"ok": True, "retired": LEGACY_BOT_RETIRED, "version": VERSION_MARKER}
 
 @app.route("/callback", methods=["POST"])
 def callback():
     if not verify_signature(request):
         abort(400)
+
+    if LEGACY_BOT_RETIRED:
+        return "OK", 200
 
     data = request.get_json(silent=True) or {}
     events = data.get("events", [])
